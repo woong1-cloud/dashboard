@@ -22,6 +22,15 @@
           <a class="btn btn-sm btn-outline-light" href="{{ url_for('backup_page') }}">
             <i class="bi bi-download"></i> 백업
           </a>
+          <div class="dropdown d-inline-block">
+            <button class="btn btn-sm btn-outline-light dropdown-toggle" type="button" id="dropdownImageSave" data-bs-toggle="dropdown" aria-expanded="false">
+              <i class="bi bi-image"></i> 이미지로 저장
+            </button>
+            <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="dropdownImageSave" style="z-index: 1060;">
+              <li><a class="dropdown-item" href="#" id="btn-copy-image"><i class="bi bi-clipboard"></i> 이미지 복사</a></li>
+              <li><a class="dropdown-item" href="#" id="btn-save-image"><i class="bi bi-download"></i> 이미지 저장</a></li>
+            </ul>
+          </div>
           {% if show_clear_data %}
           <a class="btn btn-sm btn-outline-danger" href="{{ url_for('clear_data') }}">
             <i class="bi bi-trash"></i> 초기화
@@ -55,7 +64,69 @@
     </main>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <script src="{{ url_for('static', filename='table-sort.js') }}"></script>
+    <script>
+      (function() {
+        var mainEl = document.querySelector('main');
+        if (!mainEl) return;
+
+        function captureAsCanvas() {
+          return new Promise(function(resolve, reject) {
+            if (typeof html2canvas !== 'undefined') {
+              html2canvas(mainEl, {
+                useCORS: true,
+                allowTaint: true,
+                scale: window.devicePixelRatio || 1,
+                logging: false,
+                backgroundColor: '#0b1220'
+              }).then(resolve).catch(reject);
+            } else {
+              reject(new Error('html2canvas를 불러오는 중입니다. 잠시 후 다시 시도해 주세요.'));
+            }
+          });
+        }
+
+        function doCopyImage() {
+          captureAsCanvas().then(function(canvas) {
+            canvas.toBlob(function(blob) {
+              if (!blob) {
+                alert('이미지 생성에 실패했습니다.');
+                return;
+              }
+              navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]).then(function() {
+                alert('클립보드에 이미지가 복사되었습니다.');
+              }).catch(function() {
+                alert('클립보드 복사에 실패했습니다. (HTTPS 환경에서 시도해 주세요.)');
+              });
+            }, 'image/png');
+          }).catch(function(err) {
+            alert('캡처 실패: ' + (err.message || err));
+          });
+        }
+
+        function doSaveImage() {
+          captureAsCanvas().then(function(canvas) {
+            var name = 'dashboard_' + new Date().toISOString().slice(0, 10) + '.png';
+            var a = document.createElement('a');
+            a.href = canvas.toDataURL('image/png');
+            a.download = name;
+            a.click();
+          }).catch(function(err) {
+            alert('캡처 실패: ' + (err.message || err));
+          });
+        }
+
+        document.getElementById('btn-copy-image')?.addEventListener('click', function(e) {
+          e.preventDefault();
+          doCopyImage();
+        });
+        document.getElementById('btn-save-image')?.addEventListener('click', function(e) {
+          e.preventDefault();
+          doSaveImage();
+        });
+      })();
+    </script>
   </body>
 </html>
 

@@ -2,21 +2,39 @@
 __pycache__/
 *.py[cod]
 *.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 가상환경
 .venv/
 venv/
 env/
+ENV/
 
-# Database (런타임 데이터)
-inventory.db
-inventory.db-shm
-inventory.db-wal
+# SQLite 임시 파일 (WAL 모드)
+*.db-shm
+*.db-wal
 
-# 업로드 실패 임시 파일
-failed_upload_*.csv
+# DB 파일 (원하면 주석 해제)
+# inventory.db
 
-# IDE / OS
-.idea/
-.vscode/
-*.swp
+# 업로드 파일
+uploads/
+
+# OS
 .DS_Store
 Thumbs.db
+
+# 환경변수
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp

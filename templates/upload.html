@@ -27,7 +27,7 @@
     <div class="d-flex align-items-end justify-content-between mb-4">
       <div>
         <h2 class="h5 fw-semibold mb-1">📊 재고 데이터 업로드</h2>
-        <div class="text-muted small">최대 4개 파일을 선택하고 한 번에 업로드하세요</div>
+        <div class="text-muted small">최대 5개 파일을 선택하고 한 번에 업로드하세요</div>
       </div>
     </div>
 
@@ -122,7 +122,7 @@
       </div>
 
       <!-- 4. 매장 재고 -->
-      <div class="card shadow-sm border-warning border-2 mb-4">
+      <div class="card shadow-sm border-warning border-2 mb-3">
         <div class="card-header bg-warning text-dark">
           <h3 class="h6 mb-0">
             <i class="bi bi-shop-window"></i>
@@ -145,6 +145,35 @@
             <div class="col-md-4">
               <label class="form-label fw-semibold">시트명 (선택)</label>
               <input class="form-control form-control-lg" type="text" name="channel_sheet" placeholder="첫 시트" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 5. 분배내역 -->
+      <div class="card shadow-sm border-secondary border-2 mb-4">
+        <div class="card-header bg-secondary text-white">
+          <h3 class="h6 mb-0">
+            <i class="bi bi-truck"></i>
+            <strong>5. 분배내역</strong> (선택)
+          </h3>
+        </div>
+        <div class="card-body p-4">
+          <div class="alert alert-secondary mb-3">
+            <strong>📁 파일 형식:</strong> Excel (.xlsx, .xls, .xlsb)<br>
+            <strong>📋 포함 내용:</strong> SKU(또는 상품코드), <strong>분배량</strong>(또는 N열/수량) — 분배량 기준으로 수량 표시<br>
+            <strong>🎯 결과:</strong> 대시보드 테이블 분배내역 칼럼에 수량 표시 (필업제안 ↔ 분배가능 사이)
+          </div>
+          
+          <div class="row g-3">
+            <div class="col-md-8">
+              <label class="form-label fw-semibold">분배내역 Excel 파일 선택 (선택사항)</label>
+              <input class="form-control form-control-lg" type="file" name="distribution_file" accept=".xlsx,.xls,.xlsb" />
+              <div class="form-text">예: 분배요청(1).xlsx — SKU·분배량(또는 N열) 컬럼 포함 시 같은 SKU는 수량 합계 표시</div>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label fw-semibold">시트명 (선택)</label>
+              <input class="form-control form-control-lg" type="text" name="distribution_sheet" placeholder="첫 시트" />
             </div>
           </div>
         </div>
@@ -195,6 +224,17 @@
               <div class="flex-grow-1 ms-3">
                 <strong>물류센터2 (선택)</strong>
                 <p class="text-muted small mb-0">Excel 파일을 선택하면 물류센터2 재고를 추가합니다.</p>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-4">
+            <div class="d-flex">
+              <div class="flex-shrink-0">
+                <span class="badge bg-secondary rounded-circle" style="width: 24px; height: 24px; line-height: 24px;">5</span>
+              </div>
+              <div class="flex-grow-1 ms-3">
+                <strong>분배내역 (선택)</strong>
+                <p class="text-muted small mb-0">분배요청 엑셀을 올리면 대시보드에 분배내역 칼럼으로 표시됩니다.</p>
               </div>
             </div>
           </div>

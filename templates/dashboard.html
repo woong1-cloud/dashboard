@@ -203,6 +203,22 @@
           </div>
         </div>
       </div>
+      <div class="col-6 col-lg-2">
+        <div class="card kpi-card shadow border-0 h-100" style="background: linear-gradient(135deg, rgba(107, 114, 128, 0.08) 0%, rgba(107, 114, 128, 0.03) 100%); border-left: 4px solid #6b7280 !important;">
+          <div class="card-body p-3">
+            <div class="d-flex justify-content-between align-items-start">
+              <div>
+                <div class="small mb-1 fw-semibold" style="color: #9ca3af;">📋 분배내역</div>
+                <div class="h4 mb-0 fw-bold" style="color: #d1d5db;">{{ "{:,}".format(kpi.distribution_items) }}</div>
+                <div style="font-size: 0.7rem; color: #9ca3af;">총 {{ "{:,}".format(kpi.distribution_total_qty) }}개</div>
+              </div>
+              <div class="kpi-icon bg-secondary bg-opacity-10" style="color: #9ca3af;">
+                <i class="bi bi-clipboard-data"></i>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- 시즌별 결품률 (전체 데이터 현황 ↔ 복종별 결품률 사이) -->
@@ -303,6 +319,7 @@
                     low_only='1' if selected.low_only else None,
                     warehouse_only='1' if selected.warehouse_only else None,
                     channel_only='1' if selected.channel_only else None,
+                    distribution_only='1' if selected.distribution_only else None,
                     warehouse_center=selected.warehouse_center,
                     season_code=selected.season_codes,
                     urgent_category=uc,
@@ -356,6 +373,7 @@
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">물류재고</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">소진일</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">필업 제안</th>
+                <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">분배내역</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem; background-color: #fef3c7; color: #92400e; font-weight: 600;">분배<br>가능</th>
               </tr>
             </thead>
@@ -386,6 +404,7 @@
                     {% if r.days_until_out >= 999 %}-{% else %}{{ "%.0f"|format(r.days_until_out) }}일{% endif %}
                   </td>
                   <td class="text-end fw-bold" style="padding: 0.4rem 0.5rem; color: #000;">{{ "{:,}".format(r.suggested_order_qty) }}</td>
+                  <td class="text-end text-truncate small" style="max-width: 120px; padding: 0.4rem 0.5rem;" title="{{ r.distribution_note or '' }}">{{ r.distribution_note or "-" }}</td>
                   <td class="text-end fw-bold" style="padding: 0.4rem 0.5rem; background-color: rgba(254, 243, 199, 0.4); color: #d97706;">
                     {{ "{:,}".format([r.warehouse_stock, r.suggested_order_qty]|min) }}
                   </td>
@@ -508,6 +527,14 @@
                 </label>
               </div>
             </div>
+            <div class="col-auto">
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="checkbox" value="1" id="distribution_only" name="distribution_only" {% if selected.distribution_only %}checked{% endif %} />
+                <label class="form-check-label small fw-semibold" for="distribution_only">
+                  📋 분배내역 있음
+                </label>
+              </div>
+            </div>
           </div>
         </form>
       </div>
@@ -590,6 +617,7 @@
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">물류재고<br>(합계)</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">소진<br>예상일</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">필업<br>제안</th>
+                    <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">분배내역</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem; background-color: #fef3c7; color: #92400e; font-weight: 600;">분배<br>가능</th>
                   </tr>
                 </thead>
@@ -619,6 +647,7 @@
                         {% if r.days_until_out >= 999 %}-{% else %}{{ "%.0f"|format(r.days_until_out) }}일{% endif %}
                       </td>
                       <td class="text-end fw-bold" style="padding: 0.4rem 0.5rem; color: #000;">{{ "{:,}".format(r.suggested_order_qty) }}</td>
+                      <td class="text-end text-truncate small" style="max-width: 120px; padding: 0.4rem 0.5rem;" title="{{ r.distribution_note or '' }}">{{ r.distribution_note or "-" }}</td>
                       <td class="text-end fw-bold" style="padding: 0.4rem 0.5rem; background-color: rgba(254, 243, 199, 0.4); color: #d97706;">
                         {{ "{:,}".format([r.warehouse_stock, r.suggested_order_qty]|min) }}
                       </td>
@@ -651,6 +680,8 @@
               <input type="hidden" name="warehouse_center" value="{{ selected.warehouse_center }}" />
               {% if selected.low_only %}<input type="hidden" name="low_only" value="1" />{% endif %}
               {% if selected.warehouse_only %}<input type="hidden" name="warehouse_only" value="1" />{% endif %}
+              {% if selected.channel_only %}<input type="hidden" name="channel_only" value="1" />{% endif %}
+              {% if selected.distribution_only %}<input type="hidden" name="distribution_only" value="1" />{% endif %}
               <div class="col-8">
                 <label class="form-label small text-muted mb-1">SKU</label>
                 <select class="form-select" name="sku">

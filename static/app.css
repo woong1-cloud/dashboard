@@ -11,6 +11,11 @@
 
 .navbar {
   backdrop-filter: blur(8px);
+  z-index: 1030;
+  position: relative;
+}
+.navbar .dropdown-menu {
+  z-index: 1060;
 }
 
 .card {

@@ -66,6 +66,9 @@ def get_conn(db_path: str = DB_PATH) -> sqlite3.Connection:
         if "warehouse2_stock" not in columns:
             conn.execute("ALTER TABLE snapshots ADD COLUMN warehouse2_stock INTEGER DEFAULT 0")
             conn.commit()
+        if "distribution_note" not in columns:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN distribution_note TEXT")
+            conn.commit()
     except Exception as e:
         pass  # 이미 존재하거나 다른 이유로 실패하면 무시
     
@@ -379,6 +382,24 @@ def update_channel_stock(conn: sqlite3.Connection, snapshot_date: str, sku_chann
             WHERE snapshot_date = ? AND sku = ?
             """,
             (channel_stock, dt.datetime.now().isoformat(timespec="seconds"), snapshot_date, sku)
+        )
+        if cursor.rowcount > 0:
+            updated += 1
+    conn.commit()
+    return updated
+
+
+def update_distribution_note(conn: sqlite3.Connection, snapshot_date: str, sku_note_map: dict) -> int:
+    """분배내역 업데이트 (SKU별 텍스트)"""
+    updated = 0
+    for sku, note in sku_note_map.items():
+        cursor = conn.execute(
+            """
+            UPDATE snapshots 
+            SET distribution_note = ?, updated_at = ?
+            WHERE snapshot_date = ? AND sku = ?
+            """,
+            (note or "", dt.datetime.now().isoformat(timespec="seconds"), snapshot_date, sku)
         )
         if cursor.rowcount > 0:
             updated += 1

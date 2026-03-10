@@ -135,9 +135,7 @@ streamlit run app.py
 ```cmd
 set DEPLOY_MODE=1
 python dashboard_v2.py
-```
-
-**실행 방법 (Linux/Mac):**
+```**실행 방법 (Linux/Mac):**
 
 ```bash
 DEPLOY_MODE=1 python dashboard_v2.py
