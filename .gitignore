@@ -20,8 +20,11 @@ ENV/
 *.db-shm
 *.db-wal
 
-# DB 파일 (원하면 주석 해제)
-# inventory.db
+# DB 파일 (배포 시 제외)
+inventory.db
+
+# 업로드 실패 목록 (로컬 전용)
+failed_upload_*.csv
 
 # 업로드 파일
 uploads/

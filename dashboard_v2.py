@@ -1025,13 +1025,19 @@ def clear_data():
 
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("재고 대시보드 V2 서버 시작!")
-    print("=" * 70)
-    print("접속 주소: http://127.0.0.1:5003")
-    print("기본 비밀번호: 1234")
-    if DEPLOY_MODE:
-        print("모드: 배포 (초기화 비노출, /test 비노출)")
-    print("=" * 70)
-    print("")
-    app.run(host="127.0.0.1", port=5003, debug=not DEPLOY_MODE)
+    import sys
+    # Streamlit Cloud 등에서 streamlit run으로 실행될 때는 Flask 서버를 띄우지 않음
+    if "streamlit" in sys.modules:
+        # Streamlit 전용 앱은 app.py 사용: streamlit run app.py
+        pass
+    else:
+        print("=" * 70)
+        print("재고 대시보드 V2 서버 시작!")
+        print("=" * 70)
+        print("접속 주소: http://127.0.0.1:5003")
+        print("기본 비밀번호: 1234")
+        if DEPLOY_MODE:
+            print("모드: 배포 (초기화 비노출, /test 비노출)")
+        print("=" * 70)
+        print("")
+        app.run(host="127.0.0.1", port=5003, debug=not DEPLOY_MODE)

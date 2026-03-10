@@ -54,11 +54,16 @@ python dashboard_v2.py
 - 물류재고 = 센터1 + 센터2 (자동 합계)
 - 실가용재고 = 현재재고 + 물류재고
 
-### Streamlit 버전 (옵션)
+### Streamlit 버전 (로컬 / Streamlit Cloud 배포)
 
 ```bash
 streamlit run app.py
 ```
+
+**Streamlit Cloud 배포 시:**
+1. GitHub 등에 저장소 푸시 후 [share.streamlit.io](https://share.streamlit.io)에서 앱 연결
+2. **Main file path**를 반드시 `app.py`로 지정 (Flask용 `dashboard_v2.py`가 아닌 Streamlit용 `app.py`)
+3. 필요 시 환경 변수: `DEPLOY_MODE=1` (데이터 초기화 비노출은 앱 내 메뉴로 제한)
 
 ## 3) 엑셀 데이터 형식
 
