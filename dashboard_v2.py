@@ -1274,309 +1274,342 @@ def _build_item_inventory_summary(
     return rows, prev_date, has_prev
 
 
-def _dashboard_impl():
-    # [최적화] SKU 차트는 Plotly JSON + 템플릿에서 Plotly.react (서버 to_html 제거)
-    """대시보드 로직 구현"""
+def _load_base_data() -> dict:
+    # [최적화] 스냅샷 공통 dashboard_base; suggested_order_qty·긴급·item_tab 제외, conn 내부만 사용
+    cached = cache.get("dashboard_base")
+    if cached is not None:
+        return cached
     import numpy as np
-    
+
     conn = get_conn()
-    latest_date, latest = load_latest(conn)
-    
-    # 데이터 없으면 빈 페이지
-    if latest_date is None or latest.empty:
+    try:
+        latest_date, latest = load_latest(conn)
+        if latest_date is None or latest.empty:
+            return {"latest_date": None}
+
+        all_data = latest.copy()
+        for col in (
+            "sales_qty",
+            "channel_stock",
+            "warehouse_stock",
+            "warehouse1_stock",
+            "warehouse2_stock",
+            "min_stock",
+            "lead_time_days",
+            "safety_stock",
+        ):
+            if col not in all_data.columns:
+                all_data[col] = 0
+        if "distribution_note" not in all_data.columns:
+            all_data["distribution_note"] = ""
+        all_data["distribution_note"] = all_data["distribution_note"].fillna("").astype(str)
+        all_data["category"] = all_data["category"].fillna("")
+        all_data["season_code"] = all_data["sku"].astype(str).str[4:6]
+        _current_year = dt.date.today().year
+        current_season_letter = chr(ord("A") + (_current_year - 2020))
+        prev_season_letter = chr(ord("A") + (_current_year - 2021))
+        all_data["category_code"] = all_data["sku"].astype(str).str[7]
+        all_data["sales_qty"] = all_data["sales_qty"].fillna(0).astype(int)
+        all_data["daily_sales_7d"] = (all_data["sales_qty"] / 7.0).round(2)
+        all_data["channel_stock"] = all_data["channel_stock"].fillna(0).astype(int)
+        all_data["warehouse_stock"] = all_data["warehouse_stock"].fillna(0).astype(int)
+        all_data["warehouse1_stock"] = all_data["warehouse1_stock"].fillna(0).astype(int)
+        all_data["warehouse2_stock"] = all_data["warehouse2_stock"].fillna(0).astype(int)
+        all_data["total_available"] = all_data["stock"] + all_data["warehouse_stock"]
+        all_data["days_until_out"] = 999.0
+        mask_has_sales = all_data["daily_sales_7d"] > 0
+        all_data.loc[mask_has_sales, "days_until_out"] = (
+            all_data.loc[mask_has_sales, "total_available"]
+            / all_data.loc[mask_has_sales, "daily_sales_7d"]
+        ).round(1)
+        all_data.loc[(all_data["total_available"] == 0), "days_until_out"] = 0.0
+        all_data["min_stock"] = all_data["min_stock"].fillna(0).astype(int)
+        all_data["lead_time_days"] = all_data["lead_time_days"].fillna(7).astype(int)
+        all_data["safety_stock"] = all_data["safety_stock"].fillna(0).astype(int)
+        all_data["reorder_point"] = all_data["safety_stock"] + (
+            all_data["daily_sales_7d"] * all_data["lead_time_days"]
+        )
+        conditions = [
+            (all_data["stock"] == 0) & (all_data["daily_sales_7d"] > 0),
+            (all_data["stock"] == 0),
+            (all_data["daily_sales_7d"] > 0) & (all_data["days_until_out"] < 7),
+            (all_data["stock"] <= 10) & (all_data["daily_sales_7d"] > 0),
+            (all_data["stock"] < all_data["min_stock"]) & (all_data["min_stock"] > 0),
+            (all_data["stock"] <= all_data["reorder_point"]) & (all_data["daily_sales_7d"] > 0),
+        ]
+        choices = ["긴급필업", "재고없음", "필업필요", "체크필요", "저재고", "필업검토"]
+        all_data["status"] = np.select(conditions, choices, default="정상")
+        all_data["product_code"] = all_data["sku"].astype(str).str[:10]
+
+        total_items_all = int(all_data["sku"].nunique())
+        total_stock_all = int(all_data["stock"].sum())
+        oos_all = int((all_data["status"] == "긴급필업").sum())
+        low_all = int((all_data["status"] == "체크필요").sum())
+        has_channel_all = int((all_data["channel_stock"] > 0).sum())
+        total_channel_stock_all = int(all_data["channel_stock"].sum())
+        has_warehouse_all = int((all_data["warehouse_stock"] > 0).sum())
+        total_warehouse_stock_all = int(all_data["warehouse_stock"].sum())
+        _sc_norm = all_data["season_code"].astype(str).str.strip().str.upper()
+        _mask_curr_year = _sc_norm.str.startswith(current_season_letter) & (_sc_norm.str.len() >= 2)
+        _df_curr_year = all_data[_mask_curr_year]
+        total_items_curr_year = int(_df_curr_year["sku"].nunique()) if len(_df_curr_year) > 0 else 0
+        stockout_count_curr_year = int((_df_curr_year["stock"] == 0).sum()) if len(_df_curr_year) > 0 else 0
+        stockout_rate_curr_year = (
+            round((stockout_count_curr_year / total_items_curr_year * 100), 1)
+            if total_items_curr_year > 0
+            else 0.0
+        )
+        dist_note_filled = all_data["distribution_note"].fillna("").astype(str).str.strip() != ""
+        distribution_items_all = int(dist_note_filled.sum())
+        _dist_vals = all_data.loc[dist_note_filled, "distribution_note"]
+        distribution_total_qty_all = int(
+            pd.to_numeric(_dist_vals.astype(str).str.strip(), errors="coerce").fillna(0).astype(int).sum()
+        )
+
+        def _category_stats_rows(data: pd.DataFrame) -> list:
+            sub = data[data["category_code"].notna()]
+            if sub.empty:
+                return []
+            ag = sub.groupby("category_code", as_index=False).agg(
+                total=("stock", "count"),
+                stockout=("stock", lambda s: int((s == 0).sum())),
+            )
+            ag["rate"] = (ag["stockout"] / ag["total"] * 100).where(ag["total"] > 0, 0).round(1)
+            ag = ag.rename(columns={"category_code": "code"})
+            ag = ag.sort_values("code")
+            return ag.to_dict(orient="records")
+
+        def _season_code_sort_key(c: str) -> tuple:
+            s = str(c).upper().strip()
+            if len(s) < 2:
+                return (2, s)
+            rest = s[1:]
+            if rest.isdigit():
+                return (0, int(rest))
+            return (1, rest)
+
+        _curr_mask = _sc_norm.str.startswith(current_season_letter) & (_sc_norm.str.len() >= 2)
+        all_curr_season = all_data[_curr_mask]
+        curr_year_codes = sorted(
+            {
+                str(x).strip().upper()
+                for x in all_curr_season["season_code"].dropna().unique()
+                if str(x).strip() and len(str(x).strip()) >= 2
+            },
+            key=_season_code_sort_key,
+        )
+        category_stockout_by_season: dict[str, list] = {
+            "all": _category_stats_rows(all_curr_season),
+        }
+        for code in curr_year_codes:
+            category_stockout_by_season[code] = _category_stats_rows(all_data.loc[_sc_norm == code])
+
+        sc_series = all_data["season_code"].astype(str).str.strip()
+        valid_season_mask = all_data["season_code"].notna() & (sc_series.str.len() >= 2)
+        sub_season = all_data.loc[valid_season_mask].copy()
+        if sub_season.empty:
+            season_stockout_stats = []
+        else:
+            sub_season["_sc"] = (
+                all_data.loc[valid_season_mask, "season_code"].astype(str).str.strip()
+            )
+            sg = sub_season.groupby("_sc", as_index=False).agg(
+                total=("stock", "count"),
+                stockout=("stock", lambda s: int((s == 0).sum())),
+            )
+            sg["rate"] = (sg["stockout"] / sg["total"] * 100).where(sg["total"] > 0, 0).round(1)
+            sg["letter"] = sg["_sc"].str[0].str.upper()
+            sg = sg.sort_values("_sc")
+            season_stockout_stats = [
+                {
+                    "code": str(r["_sc"]),
+                    "total": int(r["total"]),
+                    "stockout": int(r["stockout"]),
+                    "rate": float(r["rate"]),
+                    "letter": str(r["letter"]),
+                }
+                for _, r in sg.iterrows()
+            ]
+
+        season_groups = defaultdict(list)
+        for srow in season_stockout_stats:
+            season_groups[srow["letter"]].append(srow)
+
+        season_group_stats = []
+        for letter in sorted(season_groups.keys()):
+            seasons = season_groups[letter]
+            group_total = sum(se["total"] for se in seasons)
+            group_stockout = sum(se["stockout"] for se in seasons)
+            group_rate = round((group_stockout / group_total * 100), 1) if group_total > 0 else 0.0
+            season_group_stats.append({
+                "letter": letter,
+                "total": group_total,
+                "stockout": group_stockout,
+                "rate": group_rate,
+                "seasons": sorted(seasons, key=lambda x: x["code"]),
+                "is_current": letter == current_season_letter,
+                "is_prev": letter == prev_season_letter,
+            })
+
+        urgent_categories = ["(전체)"] + sorted(all_data["category_code"].dropna().unique().tolist())
+
+        omni_summary = None
+        omni_table = []
+        try:
+            omni_df = pd.read_sql_query(
+                """
+                SELECT style_code, sku_code, blocked_qty, top_store
+                FROM omni_blocked
+                WHERE snapshot_date = ?
+                """,
+                conn,
+                params=(latest_date,),
+            )
+            if not omni_df.empty:
+                omni_join = omni_df.merge(
+                    all_data[["sku", "product_code", "name", "sales_qty", "stock"]],
+                    left_on="sku_code",
+                    right_on="sku",
+                    how="left",
+                )
+                style_count = int(omni_join["style_code"].nunique())
+                blocked_total = int(omni_join["blocked_qty"].sum())
+                store_count = int(
+                    omni_join["top_store"].fillna("").replace("", pd.NA).dropna().nunique()
+                )
+                omni_summary = {
+                    "style_count": style_count,
+                    "blocked_total": blocked_total,
+                    "store_count": store_count,
+                }
+                omni_view = omni_join.copy()
+                omni_view["sales_qty"] = omni_view["sales_qty"].fillna(0).astype(int)
+                omni_view["stock"] = omni_view["stock"].fillna(0).astype(int)
+                _sn = all_data[["product_code", "name"]].copy()
+                _sn["pc"] = _sn["product_code"].astype(str).str.strip()
+                _sn["nm"] = _sn["name"].fillna("").astype(str).str.strip()
+                _sn = _sn[(_sn["pc"] != "") & (_sn["nm"] != "")]
+                style_name_lookup = _sn.drop_duplicates(subset=["pc"], keep="first").set_index("pc")["nm"].to_dict()
+                omni_view["_sk"] = omni_view["style_code"].astype(str).str.strip()
+                omni_view["style_name"] = omni_view["name"].fillna("").astype(str).str.strip()
+                _miss = omni_view["style_name"] == ""
+                omni_view.loc[_miss, "style_name"] = omni_view.loc[_miss, "_sk"].map(
+                    lambda k: style_name_lookup.get(k, "") if k else ""
+                )
+                omni_view = omni_view.drop(columns=["_sk"])
+                omni_view = omni_view.sort_values("blocked_qty", ascending=False)
+                omni_table = [
+                    {
+                        "style_code": str(r["style_code"]),
+                        "style_name": str(r.get("style_name") or "").strip(),
+                        "sku_code": str(r["sku_code"]),
+                        "blocked_qty": int(r["blocked_qty"]),
+                        "sales_qty": int(r["sales_qty"]),
+                        "stock": int(r["stock"]),
+                        "top_store": (r.get("top_store") or ""),
+                    }
+                    for r in omni_view.to_dict(orient="records")
+                ]
+        except Exception as ex:
+            print(f"[WARN] 옴니판매불가 데이터 로딩 실패: {ex}")
+            omni_summary = None
+            omni_table = []
+
+        categories = [
+            "(전체)", "긴급필업", "재고없음", "필업필요", "체크필요", "저재고", "필업검토", "정상",
+        ]
+        season_codes = ["(전체)"] + sorted(all_data["season_code"].dropna().unique().tolist())
+        kpi_all = {
+            "total_items": total_items_all,
+            "total_stock": total_stock_all,
+            "oos": oos_all,
+            "low": low_all,
+            "has_channel": has_channel_all,
+            "total_channel_stock": total_channel_stock_all,
+            "has_warehouse": has_warehouse_all,
+            "total_warehouse_stock": total_warehouse_stock_all,
+            "stockout_count": stockout_count_curr_year,
+            "stockout_rate": stockout_rate_curr_year,
+            "stockout_denominator": total_items_curr_year,
+            "distribution_items": distribution_items_all,
+            "distribution_total_qty": distribution_total_qty_all,
+        }
+        out = {
+            "latest_date": latest_date,
+            "latest": latest.copy(),
+            "all_data": all_data,
+            "kpi_all": kpi_all,
+            "category_stockout_by_season": category_stockout_by_season,
+            "curr_year_codes": curr_year_codes,
+            "current_season_letter": current_season_letter,
+            "prev_season_letter": prev_season_letter,
+            "season_group_stats": season_group_stats,
+            "season_codes": season_codes,
+            "urgent_categories": urgent_categories,
+            "categories": categories,
+            "omni_summary": omni_summary,
+            "omni_table": omni_table,
+        }
+        cache.set("dashboard_base", out, timeout=300)
+        return out
+    finally:
+        conn.close()
+
+
+def _dashboard_impl():
+    # [최적화] _load_base_data 캐시 + 요청별 suggested_order_qty·긴급·필터·아이템·차트
+    """대시보드 로직 구현"""
+    base = _load_base_data()
+    if base.get("latest_date") is None:
         return render_template("empty.html", title=APP_TITLE)
-    
-    # 필터 파라미터
+
+    latest_date = base["latest_date"]
+    latest = base["latest"]
     category = (request.args.get("category") or "(전체)").strip()
     q = (request.args.get("q") or "").strip()
     low_only = (request.args.get("low_only") or "0").strip() == "1"
     warehouse_only = (request.args.get("warehouse_only") or "0").strip() == "1"
-    channel_only = (request.args.get("channel_only") or "0").strip() == "1"  # 매장재고 필터
-    distribution_only = (request.args.get("distribution_only") or "0").strip() == "1"  # 분배내역 있음
+    channel_only = (request.args.get("channel_only") or "0").strip() == "1"
+    distribution_only = (request.args.get("distribution_only") or "0").strip() == "1"
     warehouse_center = (request.args.get("warehouse_center") or "전체").strip()
-    season_codes_selected = request.args.getlist("season_code")  # 다중 시즌 코드 필터
-    urgent_category = (request.args.get("urgent_category") or "(전체)").strip()  # 긴급주의 복종 필터
+    season_codes_selected = request.args.getlist("season_code")
+    urgent_category = (request.args.get("urgent_category") or "(전체)").strip()
     target_cover_days = int((request.args.get("target_cover_days") or "14").strip() or 14)
     sku_pick: Optional[str] = (request.args.get("sku") or "").strip() or None
-    
-    # === 1. 전체 데이터 처리 (상단 KPI용) ===
-    all_data = latest.copy()
-    
-    # 누락 컬럼 기본값 설정
-    for col in ("sales_qty", "channel_stock", "warehouse_stock", "warehouse1_stock", "warehouse2_stock", 
-                "min_stock", "lead_time_days", "safety_stock"):
-        if col not in all_data.columns:
-            all_data[col] = 0
-    if "distribution_note" not in all_data.columns:
-        all_data["distribution_note"] = ""
-    all_data["distribution_note"] = all_data["distribution_note"].fillna("").astype(str)
-    
-    all_data["category"] = all_data["category"].fillna("")
-    
-    # 시즌 코드 추출 (SKU 5,6번째 자리 = 인덱스 4:6)
-    all_data["season_code"] = all_data["sku"].astype(str).str[4:6]
 
-    # 올해 시즌 문자 (A=2020 … G=2026 …) — KPI·복종별 탭에서 공통 사용
-    _current_year = dt.date.today().year
-    current_season_letter = chr(ord("A") + (_current_year - 2020))
-    prev_season_letter = chr(ord("A") + (_current_year - 2021))
-    
-    # 복종 코드 추출 (SKU 8번째 자리 = 인덱스 7)
-    all_data["category_code"] = all_data["sku"].astype(str).str[7]
-    
-    # 판매량 및 재고 계산
-    all_data["sales_qty"] = all_data["sales_qty"].fillna(0).astype(int)
-    all_data["daily_sales_7d"] = (all_data["sales_qty"] / 7.0).round(2)
-    all_data["channel_stock"] = all_data["channel_stock"].fillna(0).astype(int)
-    all_data["warehouse_stock"] = all_data["warehouse_stock"].fillna(0).astype(int)
-    all_data["warehouse1_stock"] = all_data["warehouse1_stock"].fillna(0).astype(int)
-    all_data["warehouse2_stock"] = all_data["warehouse2_stock"].fillna(0).astype(int)
-    all_data["total_available"] = all_data["stock"] + all_data["warehouse_stock"]
-    
-    # 재고 소진 예상일
-    all_data["days_until_out"] = 999.0
-    mask_has_sales = all_data["daily_sales_7d"] > 0
-    all_data.loc[mask_has_sales, "days_until_out"] = (
-        all_data.loc[mask_has_sales, "total_available"] / all_data.loc[mask_has_sales, "daily_sales_7d"]
-    ).round(1)
-    all_data.loc[(all_data["total_available"] == 0), "days_until_out"] = 0.0
-    
-    # 발주 제안
-    all_data["min_stock"] = all_data["min_stock"].fillna(0).astype(int)
-    all_data["lead_time_days"] = all_data["lead_time_days"].fillna(7).astype(int)
-    all_data["safety_stock"] = all_data["safety_stock"].fillna(0).astype(int)
-    all_data["reorder_point"] = all_data["safety_stock"] + (all_data["daily_sales_7d"] * all_data["lead_time_days"])
-    all_data["suggested_order_qty"] = (
-        (all_data["daily_sales_7d"] * target_cover_days) - all_data["total_available"]
+    working = base["all_data"].copy()
+    working["suggested_order_qty"] = (
+        (working["daily_sales_7d"] * target_cover_days) - working["total_available"]
     ).clip(lower=0).astype(int)
-    
-    # 상태 판단
-    conditions = [
-        (all_data["stock"] == 0) & (all_data["daily_sales_7d"] > 0),
-        (all_data["stock"] == 0),
-        (all_data["daily_sales_7d"] > 0) & (all_data["days_until_out"] < 7),
-        (all_data["stock"] <= 10) & (all_data["daily_sales_7d"] > 0),
-        (all_data["stock"] < all_data["min_stock"]) & (all_data["min_stock"] > 0),
-        (all_data["stock"] <= all_data["reorder_point"]) & (all_data["daily_sales_7d"] > 0),
-    ]
-    choices = ["긴급필업", "재고없음", "필업필요", "체크필요", "저재고", "필업검토"]
-    all_data["status"] = np.select(conditions, choices, default="정상")
-    all_data["product_code"] = all_data["sku"].astype(str).str[:10]
-    
-    # 전체 KPI 계산 (상단 고정용)
-    total_items_all = int(all_data["sku"].nunique())
-    total_stock_all = int(all_data["stock"].sum())
-    oos_all = int((all_data["status"] == "긴급필업").sum())
-    low_all = int((all_data["status"] == "체크필요").sum())
-    has_channel_all = int((all_data["channel_stock"] > 0).sum())
-    total_channel_stock_all = int(all_data["channel_stock"].sum())
-    has_warehouse_all = int((all_data["warehouse_stock"] > 0).sum())
-    total_warehouse_stock_all = int(all_data["warehouse_stock"].sum())
-    # 상단 KPI 결품률: 올해 시즌(현재 연도 문자로 시작하는 시즌코드) SKU만 집계
-    _sc_norm = all_data["season_code"].astype(str).str.strip().str.upper()
-    _mask_curr_year = _sc_norm.str.startswith(current_season_letter) & (_sc_norm.str.len() >= 2)
-    _df_curr_year = all_data[_mask_curr_year]
-    total_items_curr_year = int(_df_curr_year["sku"].nunique()) if len(_df_curr_year) > 0 else 0
-    stockout_count_curr_year = int((_df_curr_year["stock"] == 0).sum()) if len(_df_curr_year) > 0 else 0
-    stockout_rate_curr_year = (
-        round((stockout_count_curr_year / total_items_curr_year * 100), 1)
-        if total_items_curr_year > 0
-        else 0.0
-    )
-    
-    # 분배내역 KPI (품목수: 분배내역 있는 행 수, 전체수량: 분배내역 값 중 숫자 합계)
-    dist_note_filled = all_data["distribution_note"].fillna("").astype(str).str.strip() != ""
-    distribution_items_all = int(dist_note_filled.sum())
-    _dist_vals = all_data.loc[dist_note_filled, "distribution_note"]
-    distribution_total_qty_all = int(
-        pd.to_numeric(_dist_vals.astype(str).str.strip(), errors="coerce").fillna(0).astype(int).sum()
-    )
 
-    def _category_stats_rows(data: pd.DataFrame) -> list:
-        """기존 _calc_category_stats와 동일: category_code가 있는 행만 복종별 건수·결품."""
-        sub = data[data["category_code"].notna()]
-        if sub.empty:
-            return []
-        ag = sub.groupby("category_code", as_index=False).agg(
-            total=("stock", "count"),
-            stockout=("stock", lambda s: int((s == 0).sum())),
+    high_risk_all = working[
+        (working["daily_sales_7d"] > 0)
+        & (
+            (working["status"].isin(["긴급필업", "필업필요", "체크필요"]))
+            | (working["days_until_out"] < 14)
         )
-        ag["rate"] = (ag["stockout"] / ag["total"] * 100).where(ag["total"] > 0, 0).round(1)
-        ag = ag.rename(columns={"category_code": "code"})
-        ag = ag.sort_values("code")
-        return ag.to_dict(orient="records")
-
-    def _season_code_sort_key(c: str) -> tuple:
-        s = str(c).upper().strip()
-        if len(s) < 2:
-            return (2, s)
-        rest = s[1:]
-        if rest.isdigit():
-            return (0, int(rest))
-        return (1, rest)
-
-    # 복종별 결품률: 올해 시즌 문자로 시작하는 시즌코드만 — 전체(올해 합) + G1, G2, … 각각
-    _curr_mask = _sc_norm.str.startswith(current_season_letter) & (_sc_norm.str.len() >= 2)
-    all_curr_season = all_data[_curr_mask]
-    curr_year_codes = sorted(
-        {
-            str(x).strip().upper()
-            for x in all_curr_season["season_code"].dropna().unique()
-            if str(x).strip() and len(str(x).strip()) >= 2
-        },
-        key=_season_code_sort_key,
-    )
-    category_stockout_by_season: dict[str, list] = {
-        "all": _category_stats_rows(all_curr_season),
-    }
-    for code in curr_year_codes:
-        category_stockout_by_season[code] = _category_stats_rows(all_data.loc[_sc_norm == code])
-
-    # 시즌별 결품률 (2자리 코드 F1, G1 등 + 첫글자 그룹) — groupby 한 번
-    sc_series = all_data["season_code"].astype(str).str.strip()
-    valid_season_mask = all_data["season_code"].notna() & (sc_series.str.len() >= 2)
-    sub_season = all_data.loc[valid_season_mask].copy()
-    if sub_season.empty:
-        season_stockout_stats = []
-    else:
-        sub_season["_sc"] = (
-            all_data.loc[valid_season_mask, "season_code"].astype(str).str.strip()
-        )
-        sg = sub_season.groupby("_sc", as_index=False).agg(
-            total=("stock", "count"),
-            stockout=("stock", lambda s: int((s == 0).sum())),
-        )
-        sg["rate"] = (sg["stockout"] / sg["total"] * 100).where(sg["total"] > 0, 0).round(1)
-        sg["letter"] = sg["_sc"].str[0].str.upper()
-        sg = sg.sort_values("_sc")
-        season_stockout_stats = [
-            {
-                "code": str(r["_sc"]),
-                "total": int(r["total"]),
-                "stockout": int(r["stockout"]),
-                "rate": float(r["rate"]),
-                "letter": str(r["letter"]),
-            }
-            for _, r in sg.iterrows()
-        ]
-
-    season_groups = defaultdict(list)
-    for s in season_stockout_stats:
-        season_groups[s["letter"]].append(s)
-
-    season_group_stats = []
-    for letter in sorted(season_groups.keys()):
-        seasons = season_groups[letter]
-        group_total = sum(se["total"] for se in seasons)
-        group_stockout = sum(se["stockout"] for se in seasons)
-        group_rate = round((group_stockout / group_total * 100), 1) if group_total > 0 else 0.0
-        season_group_stats.append({
-            "letter": letter,
-            "total": group_total,
-            "stockout": group_stockout,
-            "rate": group_rate,
-            "seasons": sorted(seasons, key=lambda x: x["code"]),
-            "is_current": letter == current_season_letter,
-            "is_prev":    letter == prev_season_letter,
-        })
-    
-    # 전체 데이터 기준 긴급주의 써머리 (상위 30개, 복종별 필터 적용)
-    high_risk_all = all_data[
-        (all_data["daily_sales_7d"] > 0) & 
-        ((all_data["status"].isin(["긴급필업", "필업필요", "체크필요"])) | (all_data["days_until_out"] < 14))
     ].copy()
-    
-    # 긴급주의 복종 필터링
     if urgent_category != "(전체)":
         high_risk_all = high_risk_all[high_risk_all["category_code"] == urgent_category]
-    
     high_risk_summary = (
         high_risk_all.sort_values("daily_sales_7d", ascending=False).head(30).to_dict(orient="records")
         if not high_risk_all.empty
         else []
     )
-    
-    # 긴급주의용 복종 코드 목록 (전체 데이터 기준)
-    urgent_categories = ["(전체)"] + sorted(all_data["category_code"].dropna().unique().tolist())
-    
-    # === 2. 옴니판매불가 SKU 데이터 처리 ===
-    omni_summary = None
-    omni_table = []
-    try:
-        omni_df = pd.read_sql_query(
-            """
-            SELECT style_code, sku_code, blocked_qty, top_store
-            FROM omni_blocked
-            WHERE snapshot_date = ?
-            """,
-            conn,
-            params=(latest_date,),
-        )
-        if not omni_df.empty:
-            omni_join = omni_df.merge(
-                all_data[["sku", "product_code", "name", "sales_qty", "stock"]],
-                left_on="sku_code",
-                right_on="sku",
-                how="left",
-            )
-            style_count = int(omni_join["style_code"].nunique())
-            blocked_total = int(omni_join["blocked_qty"].sum())
-            store_count = int(
-                omni_join["top_store"].fillna("").replace("", pd.NA).dropna().nunique()
-            )
-            omni_summary = {
-                "style_count": style_count,
-                "blocked_total": blocked_total,
-                "store_count": store_count,
-            }
-            omni_view = omni_join.copy()
-            omni_view["sales_qty"] = omni_view["sales_qty"].fillna(0).astype(int)
-            omni_view["stock"] = omni_view["stock"].fillna(0).astype(int)
-            # 스타일코드 → 상품명: SKU로 조인된 name 우선, 없으면 상품코드(10자)=스타일코드 매칭
-            _sn = all_data[["product_code", "name"]].copy()
-            _sn["pc"] = _sn["product_code"].astype(str).str.strip()
-            _sn["nm"] = _sn["name"].fillna("").astype(str).str.strip()
-            _sn = _sn[(_sn["pc"] != "") & (_sn["nm"] != "")]
-            style_name_lookup = _sn.drop_duplicates(subset=["pc"], keep="first").set_index("pc")["nm"].to_dict()
-            omni_view["_sk"] = omni_view["style_code"].astype(str).str.strip()
-            omni_view["style_name"] = omni_view["name"].fillna("").astype(str).str.strip()
-            _miss = omni_view["style_name"] == ""
-            omni_view.loc[_miss, "style_name"] = omni_view.loc[_miss, "_sk"].map(
-                lambda k: style_name_lookup.get(k, "") if k else ""
-            )
-            omni_view = omni_view.drop(columns=["_sk"])
-            omni_view = omni_view.sort_values("blocked_qty", ascending=False)
-            omni_table = [
-                {
-                    "style_code": str(r["style_code"]),
-                    "style_name": str(r.get("style_name") or "").strip(),
-                    "sku_code": str(r["sku_code"]),
-                    "blocked_qty": int(r["blocked_qty"]),
-                    "sales_qty": int(r["sales_qty"]),
-                    "stock": int(r["stock"]),
-                    "top_store": (r.get("top_store") or ""),
-                }
-                for r in omni_view.to_dict(orient="records")
-            ]
-    except Exception as ex:
-        print(f"[WARN] 옴니판매불가 데이터 로딩 실패: {ex}")
-        omni_summary = None
-        omni_table = []
 
-    # === 3. 필터링된 데이터 처리 ===
-    view = all_data.copy()
-    
-    # 상태 카테고리 목록
-    status_list = ["(전체)", "긴급필업", "재고없음", "필업필요", "체크필요", "저재고", "필업검토", "정상"]
-    categories = status_list
-    
-    # 시즌 코드 목록 생성 (정렬된 유니크 값)
-    season_codes = ["(전체)"] + sorted(all_data["season_code"].dropna().unique().tolist())
-    
-    # 검색 필터링 (하이브리드: 쉼표=OR, 공백=AND)
-    # 예: "SPPP G11" → SPPP AND G11
-    #     "SPPP, G23" → SPPP OR G23
-    #     "SPPP G11, G23 U0" → (SPPP AND G11) OR (G23 AND U0)
+    kpi_all = base["kpi_all"]
+    category_stockout_by_season = base["category_stockout_by_season"]
+    curr_year_codes = base["curr_year_codes"]
+    current_season_letter = base["current_season_letter"]
+    prev_season_letter = base["prev_season_letter"]
+    season_group_stats = base["season_group_stats"]
+    categories = base["categories"]
+    season_codes = base["season_codes"]
+    urgent_categories = base["urgent_categories"]
+    omni_summary = base["omni_summary"]
+    omni_table = base["omni_table"]
+
+    view = working.copy()
     if q:
         or_groups = [g.strip() for g in q.split(",") if g.strip()]
         vq = view.copy()
@@ -1593,45 +1626,40 @@ def _dashboard_impl():
                 group_mask = group_mask & term_mask
             final_mask = final_mask | group_mask
         view = vq.loc[final_mask].drop(columns=["_sku_l", "_nm_l"], errors="ignore")
-    
-    # 상태 필터링
+
     if category != "(전체)":
         view = view[view["status"] == category]
-    
-    # 시즌 코드 필터링 (다중 선택)
+
     if season_codes_selected and len(season_codes_selected) > 0:
         view = view[view["season_code"].isin(season_codes_selected)]
-    
+
     if low_only:
         view = view[view["status"].isin(["긴급필업", "재고없음", "필업필요", "체크필요", "저재고", "필업검토"])]
-    
+
     if warehouse_only:
         view = view[view["warehouse_stock"] > 0]
-    
+
     if channel_only:
         view = view[view["channel_stock"] > 0]
-    
+
     if distribution_only:
         view = view[view["distribution_note"].fillna("").astype(str).str.strip() != ""]
-    
-    # 물류센터별 필터링
+
     if warehouse_center == "센터1":
         view = view[view["warehouse1_stock"] > 0]
     elif warehouse_center == "센터2":
         view = view[view["warehouse2_stock"] > 0]
-    
-    # 필터링된 데이터에 avg_daily_usage_est 추가 (테이블 표시용)
+
     view["avg_daily_usage_est"] = 0.0
-    
-    # 필터링된 KPI 계산
+
     filtered_items = int(view["sku"].nunique())
     filtered_stockout_count = int((view["stock"] == 0).sum())
     filtered_stockout_rate = round((filtered_stockout_count / filtered_items * 100), 1) if filtered_items > 0 else 0.0
-    # 물류가용재고가 있는 품목 수 (warehouse_stock > 0) 및 비율
     filtered_warehouse_available_count = int((view["warehouse_stock"] > 0).sum())
-    filtered_warehouse_available_pct = round((filtered_warehouse_available_count / filtered_items * 100), 1) if filtered_items > 0 else 0.0
-    
-    # 전체 테이블: 판매량 높은 순으로 정렬 (필업제안 ↔ 분배가능 사이에 분배내역)
+    filtered_warehouse_available_pct = round(
+        (filtered_warehouse_available_count / filtered_items * 100), 1
+    ) if filtered_items > 0 else 0.0
+
     table_columns = [
         "status", "product_code", "sku", "name", "category", "stock", "channel_stock",
         "warehouse1_stock", "warehouse2_stock", "warehouse_stock",
@@ -1639,67 +1667,51 @@ def _dashboard_impl():
         "min_stock", "reorder_point", "avg_daily_usage_est",
         "lead_time_days", "safety_stock",
     ]
-    
+
     table = (
         view[table_columns]
         .sort_values("daily_sales_7d", ascending=False)
         .to_dict(orient="records")
     )
-    
-    # 아이템별 재고 현황 (올해 시즌 + item_tab, 판매량순 / 상세는 올해 G* 전체)
+
     item_tab_req = (request.args.get("item_tab") or "all").strip().upper()
     if item_tab_req != "ALL" and item_tab_req not in {str(c).upper() for c in curr_year_codes}:
         item_tab_req = "ALL"
     item_tab_selected = item_tab_req.lower()
-    item_summary, item_prev_date, item_has_prev = _build_item_inventory_summary(
-        conn,
-        str(latest_date),
-        latest,
-        current_season_letter,
-        item_tab_req,
-        curr_year_codes,
-    )
 
-    # SKU 히스토리 차트
-    sku_list = sorted(latest["sku"].astype(str).unique().tolist())
-    sku_pick = sku_pick or (sku_list[0] if sku_list else None)
-    chart_sku_line_html = None
-    chart_sku_delta_html = None
-    
-    if sku_pick:
-        hist = load_history(conn, sku_pick)
-        if len(hist) >= 2:
-            h = compute_daily_change(hist)
-            h["snapshot_date"] = pd.to_datetime(h["snapshot_date"])
-            
-            fig_line = px.line(h, x="snapshot_date", y="stock", markers=True, title=f"SKU {sku_pick} 재고 변동")
-            fig_line.update_layout(height=300)
-            
-            fig_delta = px.bar(h.dropna(subset=["delta"]), x="snapshot_date", y="delta", title="일별 재고 증감")
-            fig_delta.update_layout(height=250)
-            
-            # 템플릿: Plotly.react('chart-sku-line', fig.data, fig.layout) — chart_*_html은 JSON 문자열
-            chart_sku_line_html = fig_line.to_json()
-            chart_sku_delta_html = fig_delta.to_json()
-    
-    # 전체 KPI (상단 고정용)
-    kpi_all = {
-        "total_items": total_items_all,
-        "total_stock": total_stock_all,
-        "oos": oos_all,
-        "low": low_all,
-        "has_channel": has_channel_all,
-        "total_channel_stock": total_channel_stock_all,
-        "has_warehouse": has_warehouse_all,
-        "total_warehouse_stock": total_warehouse_stock_all,
-        "stockout_count": stockout_count_curr_year,
-        "stockout_rate": stockout_rate_curr_year,
-        "stockout_denominator": total_items_curr_year,
-        "distribution_items": distribution_items_all,
-        "distribution_total_qty": distribution_total_qty_all,
-    }
-    
-    # 필터링된 KPI (필터 영역 하단용)
+    conn = get_conn()
+    try:
+        item_summary, item_prev_date, item_has_prev = _build_item_inventory_summary(
+            conn,
+            str(latest_date),
+            latest,
+            current_season_letter,
+            item_tab_req,
+            curr_year_codes,
+        )
+
+        sku_list = sorted(latest["sku"].astype(str).unique().tolist())
+        sku_pick = sku_pick or (sku_list[0] if sku_list else None)
+        chart_sku_line_html = None
+        chart_sku_delta_html = None
+
+        if sku_pick:
+            hist = load_history(conn, sku_pick)
+            if len(hist) >= 2:
+                h = compute_daily_change(hist)
+                h["snapshot_date"] = pd.to_datetime(h["snapshot_date"])
+
+                fig_line = px.line(h, x="snapshot_date", y="stock", markers=True, title=f"SKU {sku_pick} 재고 변동")
+                fig_line.update_layout(height=300)
+
+                fig_delta = px.bar(h.dropna(subset=["delta"]), x="snapshot_date", y="delta", title="일별 재고 증감")
+                fig_delta.update_layout(height=250)
+
+                chart_sku_line_html = fig_line.to_json()
+                chart_sku_delta_html = fig_delta.to_json()
+    finally:
+        conn.close()
+
     kpi_filtered = {
         "total_items": filtered_items,
         "stockout_count": filtered_stockout_count,
@@ -1707,21 +1719,21 @@ def _dashboard_impl():
         "warehouse_available_count": filtered_warehouse_available_count,
         "warehouse_available_pct": filtered_warehouse_available_pct,
     }
-    
+
     return render_template(
         "dashboard.html",
         title=APP_TITLE,
         latest_date=latest_date,
-        kpi=kpi_all,  # 전체 KPI (상단)
-        kpi_filtered=kpi_filtered,  # 필터링된 KPI (필터 하단)
+        kpi=kpi_all,
+        kpi_filtered=kpi_filtered,
         category_stockout_by_season=category_stockout_by_season,
         curr_year_season_codes=curr_year_codes,
         current_season_letter=current_season_letter,
         prev_season_letter=prev_season_letter,
-        season_group_stats=season_group_stats,  # 시즌별 결품률 (첫글자 그룹 + 2자리 시즌)
+        season_group_stats=season_group_stats,
         categories=categories,
-        season_codes=season_codes,  # 시즌 코드 목록
-        urgent_categories=urgent_categories,  # 긴급주의 복종 코드 목록
+        season_codes=season_codes,
+        urgent_categories=urgent_categories,
         selected={
             "category": category,
             "q": q,
@@ -1730,8 +1742,8 @@ def _dashboard_impl():
             "channel_only": channel_only,
             "distribution_only": distribution_only,
             "warehouse_center": warehouse_center,
-            "season_codes": season_codes_selected,  # 다중 시즌 코드 필터
-            "urgent_category": urgent_category,  # 긴급주의 복종 필터
+            "season_codes": season_codes_selected,
+            "urgent_category": urgent_category,
             "target_cover_days": target_cover_days,
             "sku": sku_pick,
             "item_tab": item_tab_selected,
