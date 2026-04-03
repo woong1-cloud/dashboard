@@ -20,6 +20,14 @@ class CoreConfig:
 
 CFG = CoreConfig()
 
+# 대시보드 load_latest 전용 (SELECT * 대신 명시 컬럼으로 I/O·메모리 절약)
+SNAPSHOT_SELECT_SQL = """
+SELECT snapshot_date, sku, name, category, stock, channel_stock, warehouse_stock,
+       warehouse1_stock, warehouse2_stock, min_stock, lead_time_days, safety_stock,
+       sales_qty, updated_at, distribution_note
+FROM snapshots WHERE snapshot_date = ?
+"""
+
 
 def get_conn(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -489,7 +497,7 @@ def load_latest(conn: sqlite3.Connection) -> tuple[Optional[str], pd.DataFrame]:
     latest = cur.fetchone()[0]
     if not latest:
         return None, pd.DataFrame()
-    df = pd.read_sql_query("SELECT * FROM snapshots WHERE snapshot_date = ?", conn, params=(latest,))
+    df = pd.read_sql_query(SNAPSHOT_SELECT_SQL, conn, params=(latest,))
     return latest, df
 
 

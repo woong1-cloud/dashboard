@@ -1011,6 +1011,38 @@ def _df_filter_item_tab(
     return df.loc[mask].copy()
 
 
+def _sql_prev_item_stock_totals(
+    conn,
+    prev_date: str,
+    current_season_letter: str,
+    item_tab: str,
+) -> pd.DataFrame:
+    """직전 스냅샷에서 아이템코드(SKU 3~4자리)별 재고 합. `_df_filter_item_tab`과 동일한 시즌/탭 필터."""
+    tab_u = (item_tab or "all").strip().upper()
+    letter = (current_season_letter or "").strip().upper()[:1]
+    if not letter:
+        return pd.DataFrame(columns=["item_code", "stock_prev"])
+    sql = """
+        SELECT
+            UPPER(SUBSTR(TRIM(sku), 3, 2)) AS item_code,
+            SUM(COALESCE(stock, 0)) AS stock_prev
+        FROM snapshots
+        WHERE snapshot_date = ?
+          AND LENGTH(TRIM(sku)) >= 6
+          AND UPPER(SUBSTR(TRIM(sku), 5, 1)) = ?
+          AND LENGTH(TRIM(SUBSTR(TRIM(sku), 5, 2))) >= 2
+    """
+    params: list = [prev_date, letter]
+    if tab_u and tab_u != "ALL":
+        sql += " AND UPPER(SUBSTR(TRIM(sku), 5, 2)) = ? "
+        params.append(tab_u)
+    sql += """
+        GROUP BY UPPER(SUBSTR(TRIM(sku), 3, 2))
+        HAVING LENGTH(TRIM(item_code)) > 0
+    """
+    return pd.read_sql_query(sql, conn, params=params)
+
+
 def _build_item_inventory_summary(
     conn,
     latest_date: str,
@@ -1096,19 +1128,10 @@ def _build_item_inventory_summary(
         cur_agg["sales_share_pct"] = (cur_agg["total_sales"] / total_sales_all * 100.0).round(2)
 
     if has_prev and prev_date:
-        prev_df = pd.read_sql_query(
-            "SELECT sku, stock, sales_qty, name FROM snapshots WHERE snapshot_date = ?",
-            conn,
-            params=(prev_date,),
-        )
-        prev_for_table = _df_filter_item_tab(prev_df, current_season_letter, tab_u)
-        prev_agg = agg_items(prev_for_table).rename(
-            columns={"total_stock": "stock_prev", "total_sales": "sales_prev"}
-        )
-        merged = cur_agg.merge(prev_agg[["item_code", "stock_prev"]], on="item_code", how="left")
-        merged["stock_prev"] = merged["stock_prev"].fillna(0)
-        merged["stock_prev"] = merged["stock_prev"].astype(int)
-        merged["stock_delta"] = merged["total_stock"].astype(int) - merged["stock_prev"].astype(int)
+        prev_agg = _sql_prev_item_stock_totals(conn, prev_date, current_season_letter, tab_u)
+        merged = cur_agg.merge(prev_agg, on="item_code", how="left")
+        merged["stock_prev"] = merged["stock_prev"].fillna(0).astype(int)
+        merged["stock_delta"] = merged["total_stock"].astype(int) - merged["stock_prev"]
     else:
         merged = cur_agg.copy()
         merged["stock_prev"] = pd.NA
@@ -1323,21 +1346,24 @@ def _dashboard_impl():
     # 분배내역 KPI (품목수: 분배내역 있는 행 수, 전체수량: 분배내역 값 중 숫자 합계)
     dist_note_filled = all_data["distribution_note"].fillna("").astype(str).str.strip() != ""
     distribution_items_all = int(dist_note_filled.sum())
-    distribution_total_qty_all = 0
-    for v in all_data.loc[dist_note_filled, "distribution_note"]:
-        n = pd.to_numeric(str(v).strip(), errors="coerce")
-        if pd.notna(n):
-            distribution_total_qty_all += int(n)
-    
-    def _calc_category_stats(data: pd.DataFrame) -> list:
-        result = []
-        for cat_code in sorted(data["category_code"].dropna().unique()):
-            cat_data = data[data["category_code"] == cat_code]
-            cat_total = len(cat_data)
-            cat_stockout = int((cat_data["stock"] == 0).sum())
-            cat_rate = round((cat_stockout / cat_total * 100), 1) if cat_total > 0 else 0.0
-            result.append({"code": cat_code, "total": cat_total, "stockout": cat_stockout, "rate": cat_rate})
-        return result
+    _dist_vals = all_data.loc[dist_note_filled, "distribution_note"]
+    distribution_total_qty_all = int(
+        pd.to_numeric(_dist_vals.astype(str).str.strip(), errors="coerce").fillna(0).astype(int).sum()
+    )
+
+    def _category_stats_rows(data: pd.DataFrame) -> list:
+        """기존 _calc_category_stats와 동일: category_code가 있는 행만 복종별 건수·결품."""
+        sub = data[data["category_code"].notna()]
+        if sub.empty:
+            return []
+        ag = sub.groupby("category_code", as_index=False).agg(
+            total=("stock", "count"),
+            stockout=("stock", lambda s: int((s == 0).sum())),
+        )
+        ag["rate"] = (ag["stockout"] / ag["total"] * 100).where(ag["total"] > 0, 0).round(1)
+        ag = ag.rename(columns={"category_code": "code"})
+        ag = ag.sort_values("code")
+        return ag.to_dict(orient="records")
 
     def _season_code_sort_key(c: str) -> tuple:
         s = str(c).upper().strip()
@@ -1360,30 +1386,38 @@ def _dashboard_impl():
         key=_season_code_sort_key,
     )
     category_stockout_by_season: dict[str, list] = {
-        "all": _calc_category_stats(all_curr_season),
+        "all": _category_stats_rows(all_curr_season),
     }
     for code in curr_year_codes:
-        category_stockout_by_season[code] = _calc_category_stats(
-            all_data[_sc_norm == code]
-        )
+        category_stockout_by_season[code] = _category_stats_rows(all_data.loc[_sc_norm == code])
 
-    # 시즌별 결품률 계산 (2자리 코드 F1, G1 등 + 첫글자 그룹)
-    season_stockout_stats = []
-    for sc in sorted(all_data["season_code"].dropna().unique()):
-        sc_str = str(sc).strip()
-        if not sc_str or len(sc_str) < 2:
-            continue
-        sc_data = all_data[all_data["season_code"] == sc]
-        sc_total = len(sc_data)
-        sc_stockout = int((sc_data["stock"] == 0).sum())
-        sc_rate = round((sc_stockout / sc_total * 100), 1) if sc_total > 0 else 0.0
-        season_stockout_stats.append({
-            "code": sc_str,
-            "total": sc_total,
-            "stockout": sc_stockout,
-            "rate": sc_rate,
-            "letter": sc_str[0].upper(),
-        })
+    # 시즌별 결품률 (2자리 코드 F1, G1 등 + 첫글자 그룹) — groupby 한 번
+    sc_series = all_data["season_code"].astype(str).str.strip()
+    valid_season_mask = all_data["season_code"].notna() & (sc_series.str.len() >= 2)
+    sub_season = all_data.loc[valid_season_mask].copy()
+    if sub_season.empty:
+        season_stockout_stats = []
+    else:
+        sub_season["_sc"] = (
+            all_data.loc[valid_season_mask, "season_code"].astype(str).str.strip()
+        )
+        sg = sub_season.groupby("_sc", as_index=False).agg(
+            total=("stock", "count"),
+            stockout=("stock", lambda s: int((s == 0).sum())),
+        )
+        sg["rate"] = (sg["stockout"] / sg["total"] * 100).where(sg["total"] > 0, 0).round(1)
+        sg["letter"] = sg["_sc"].str[0].str.upper()
+        sg = sg.sort_values("_sc")
+        season_stockout_stats = [
+            {
+                "code": str(r["_sc"]),
+                "total": int(r["total"]),
+                "stockout": int(r["stockout"]),
+                "rate": float(r["rate"]),
+                "letter": str(r["letter"]),
+            }
+            for _, r in sg.iterrows()
+        ]
 
     season_groups = defaultdict(list)
     for s in season_stockout_stats:
@@ -1481,7 +1515,7 @@ def _dashboard_impl():
                     "stock": int(r["stock"]),
                     "top_store": (r.get("top_store") or ""),
                 }
-                for _, r in omni_view.iterrows()
+                for r in omni_view.to_dict(orient="records")
             ]
     except Exception as ex:
         print(f"[WARN] 옴니판매불가 데이터 로딩 실패: {ex}")
@@ -1503,25 +1537,21 @@ def _dashboard_impl():
     #     "SPPP, G23" → SPPP OR G23
     #     "SPPP G11, G23 U0" → (SPPP AND G11) OR (G23 AND U0)
     if q:
-        # 쉼표로 OR 그룹 분리 (pd는 모듈 상단에서 import됨)
-        or_groups = [g.strip() for g in q.split(',') if g.strip()]
-        final_mask = pd.Series([False] * len(view), index=view.index)
-        
+        or_groups = [g.strip() for g in q.split(",") if g.strip()]
+        vq = view.copy()
+        vq["_sku_l"] = vq["sku"].astype(str).str.lower()
+        vq["_nm_l"] = vq["name"].fillna("").astype(str).str.lower()
+        final_mask = pd.Series([False] * len(vq), index=vq.index)
         for group in or_groups:
-            # 각 그룹 내에서 공백으로 AND 조건 분리
             and_terms = group.lower().split()
-            group_mask = pd.Series([True] * len(view), index=view.index)
-            
+            group_mask = pd.Series([True] * len(vq), index=vq.index)
             for term in and_terms:
-                term_mask = (
-                    view["sku"].astype(str).str.lower().str.contains(term, na=False) |
-                    view["name"].fillna("").astype(str).str.lower().str.contains(term, na=False)
-                )
+                term_mask = vq["_sku_l"].str.contains(term, na=False, regex=False) | vq[
+                    "_nm_l"
+                ].str.contains(term, na=False, regex=False)
                 group_mask = group_mask & term_mask
-            
             final_mask = final_mask | group_mask
-        
-        view = view[final_mask]
+        view = vq.loc[final_mask].drop(columns=["_sku_l", "_nm_l"], errors="ignore")
     
     # 상태 필터링
     if category != "(전체)":
