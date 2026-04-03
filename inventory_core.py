@@ -29,80 +29,90 @@ FROM snapshots WHERE snapshot_date = ?
 """
 
 
+def init_db(db_path: str = DB_PATH) -> None:
+    # [최적화] 스키마·마이그레이션을 앱 기동 시 1회만 실행
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshots (
+                snapshot_date TEXT NOT NULL,
+                sku TEXT NOT NULL,
+                name TEXT,
+                category TEXT,
+                stock INTEGER NOT NULL,
+                channel_stock INTEGER,
+                warehouse_stock INTEGER,
+                warehouse1_stock INTEGER,
+                warehouse2_stock INTEGER,
+                min_stock INTEGER,
+                lead_time_days INTEGER,
+                safety_stock INTEGER,
+                sales_qty INTEGER,
+                updated_at TEXT,
+                PRIMARY KEY (snapshot_date, sku)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_sku_date ON snapshots (sku, snapshot_date);"
+        )
+
+        try:
+            cursor = conn.execute("PRAGMA table_info(snapshots)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "sales_qty" not in columns:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN sales_qty INTEGER DEFAULT 0")
+                conn.commit()
+            if "channel_stock" not in columns:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN channel_stock INTEGER DEFAULT 0")
+                conn.commit()
+            if "warehouse_stock" not in columns:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN warehouse_stock INTEGER DEFAULT 0")
+                conn.commit()
+            if "warehouse1_stock" not in columns:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN warehouse1_stock INTEGER DEFAULT 0")
+                conn.commit()
+            if "warehouse2_stock" not in columns:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN warehouse2_stock INTEGER DEFAULT 0")
+                conn.commit()
+            if "distribution_note" not in columns:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN distribution_note TEXT")
+                conn.commit()
+        except Exception:
+            pass
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS omni_blocked (
+                snapshot_date TEXT NOT NULL,
+                style_code TEXT NOT NULL,
+                sku_code TEXT NOT NULL,
+                blocked_qty INTEGER NOT NULL,
+                top_store TEXT,
+                PRIMARY KEY (snapshot_date, style_code, sku_code)
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_conn(db_path: str = DB_PATH) -> sqlite3.Connection:
+    # [최적화] 연결만 생성; 스키마는 init_db에서 처리
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS snapshots (
-            snapshot_date TEXT NOT NULL,
-            sku TEXT NOT NULL,
-            name TEXT,
-            category TEXT,
-            stock INTEGER NOT NULL,
-            channel_stock INTEGER,
-            warehouse_stock INTEGER,
-            warehouse1_stock INTEGER,
-            warehouse2_stock INTEGER,
-            min_stock INTEGER,
-            lead_time_days INTEGER,
-            safety_stock INTEGER,
-            sales_qty INTEGER,
-            updated_at TEXT,
-            PRIMARY KEY (snapshot_date, sku)
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_sku_date ON snapshots (sku, snapshot_date);")
-    
-    # 마이그레이션: sales_qty 컬럼이 없으면 추가
-    try:
-        cursor = conn.execute("PRAGMA table_info(snapshots)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if "sales_qty" not in columns:
-            conn.execute("ALTER TABLE snapshots ADD COLUMN sales_qty INTEGER DEFAULT 0")
-            conn.commit()
-        if "channel_stock" not in columns:
-            conn.execute("ALTER TABLE snapshots ADD COLUMN channel_stock INTEGER DEFAULT 0")
-            conn.commit()
-        if "warehouse_stock" not in columns:
-            conn.execute("ALTER TABLE snapshots ADD COLUMN warehouse_stock INTEGER DEFAULT 0")
-            conn.commit()
-        if "warehouse1_stock" not in columns:
-            conn.execute("ALTER TABLE snapshots ADD COLUMN warehouse1_stock INTEGER DEFAULT 0")
-            conn.commit()
-        if "warehouse2_stock" not in columns:
-            conn.execute("ALTER TABLE snapshots ADD COLUMN warehouse2_stock INTEGER DEFAULT 0")
-            conn.commit()
-        if "distribution_note" not in columns:
-            conn.execute("ALTER TABLE snapshots ADD COLUMN distribution_note TEXT")
-            conn.commit()
-    except Exception as e:
-        pass  # 이미 존재하거나 다른 이유로 실패하면 무시
-    
-    # 옴니판매불가 SKU 테이블
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS omni_blocked (
-            snapshot_date TEXT NOT NULL,
-            style_code TEXT NOT NULL,
-            sku_code TEXT NOT NULL,
-            blocked_qty INTEGER NOT NULL,
-            top_store TEXT,
-            PRIMARY KEY (snapshot_date, style_code, sku_code)
-        )
-        """
-    )
-    
-    # settings 테이블 (비밀번호 저장용)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """
-    )
     return conn
 
 
@@ -397,98 +407,111 @@ def upsert_snapshot(conn: sqlite3.Connection, snap: pd.DataFrame) -> int:
 
 
 def update_channel_stock(conn: sqlite3.Connection, snapshot_date: str, sku_channel_map: dict) -> int:
+    # [최적화] executemany + total_changes로 실제 변경 행 수 집계
     """매장재고 업데이트"""
-    updated = 0
-    for sku, channel_stock in sku_channel_map.items():
-        cursor = conn.execute(
-            """
-            UPDATE snapshots 
-            SET channel_stock = ?, updated_at = ?
-            WHERE snapshot_date = ? AND sku = ?
-            """,
-            (channel_stock, dt.datetime.now().isoformat(timespec="seconds"), snapshot_date, sku)
-        )
-        if cursor.rowcount > 0:
-            updated += 1
+    if not sku_channel_map:
+        return 0
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    rows = [
+        (channel_stock, now, snapshot_date, sku)
+        for sku, channel_stock in sku_channel_map.items()
+    ]
+    n0 = conn.total_changes
+    conn.executemany(
+        """
+        UPDATE snapshots
+        SET channel_stock = ?, updated_at = ?
+        WHERE snapshot_date = ? AND sku = ?
+        """,
+        rows,
+    )
     conn.commit()
-    return updated
+    return conn.total_changes - n0
 
 
 def update_distribution_note(conn: sqlite3.Connection, snapshot_date: str, sku_note_map: dict) -> int:
+    # [최적화] executemany + total_changes로 실제 변경 행 수 집계
     """분배내역 업데이트 (SKU별 텍스트)"""
-    updated = 0
-    for sku, note in sku_note_map.items():
-        cursor = conn.execute(
-            """
-            UPDATE snapshots 
-            SET distribution_note = ?, updated_at = ?
-            WHERE snapshot_date = ? AND sku = ?
-            """,
-            (note or "", dt.datetime.now().isoformat(timespec="seconds"), snapshot_date, sku)
-        )
-        if cursor.rowcount > 0:
-            updated += 1
+    if not sku_note_map:
+        return 0
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    rows = [
+        (note or "", now, snapshot_date, sku)
+        for sku, note in sku_note_map.items()
+    ]
+    n0 = conn.total_changes
+    conn.executemany(
+        """
+        UPDATE snapshots
+        SET distribution_note = ?, updated_at = ?
+        WHERE snapshot_date = ? AND sku = ?
+        """,
+        rows,
+    )
     conn.commit()
-    return updated
+    return conn.total_changes - n0
 
 
 def update_warehouse_stock(conn: sqlite3.Connection, snapshot_date: str, sku_warehouse_map: dict, warehouse_num: int = 0) -> int:
+    # [최적화] executemany 후 합계 UPDATE; 배치 반영 건수는 total_changes 차이로 집계
     """물류재고 업데이트 (warehouse_num: 0=전체, 1=센터1, 2=센터2)"""
     updated = 0
-    
-    if warehouse_num == 1:
-        # 물류센터1 업데이트
-        for sku, warehouse_stock in sku_warehouse_map.items():
-            cursor = conn.execute(
+    now = dt.datetime.now().isoformat(timespec="seconds")
+
+    if sku_warehouse_map:
+        n0 = conn.total_changes
+        if warehouse_num == 1:
+            rows = [
+                (warehouse_stock, now, snapshot_date, sku)
+                for sku, warehouse_stock in sku_warehouse_map.items()
+            ]
+            conn.executemany(
                 """
-                UPDATE snapshots 
+                UPDATE snapshots
                 SET warehouse1_stock = ?, updated_at = ?
                 WHERE snapshot_date = ? AND sku = ?
                 """,
-                (warehouse_stock, dt.datetime.now().isoformat(timespec="seconds"), snapshot_date, sku)
+                rows,
             )
-            if cursor.rowcount > 0:
-                updated += 1
-    elif warehouse_num == 2:
-        # 물류센터2 업데이트
-        for sku, warehouse_stock in sku_warehouse_map.items():
-            cursor = conn.execute(
+        elif warehouse_num == 2:
+            rows = [
+                (warehouse_stock, now, snapshot_date, sku)
+                for sku, warehouse_stock in sku_warehouse_map.items()
+            ]
+            conn.executemany(
                 """
-                UPDATE snapshots 
+                UPDATE snapshots
                 SET warehouse2_stock = ?, updated_at = ?
                 WHERE snapshot_date = ? AND sku = ?
                 """,
-                (warehouse_stock, dt.datetime.now().isoformat(timespec="seconds"), snapshot_date, sku)
+                rows,
             )
-            if cursor.rowcount > 0:
-                updated += 1
-    else:
-        # 전체 물류재고 업데이트 (이전 호환성)
-        for sku, warehouse_stock in sku_warehouse_map.items():
-            cursor = conn.execute(
+        else:
+            rows = [
+                (warehouse_stock, now, snapshot_date, sku)
+                for sku, warehouse_stock in sku_warehouse_map.items()
+            ]
+            conn.executemany(
                 """
-                UPDATE snapshots 
+                UPDATE snapshots
                 SET warehouse_stock = ?, updated_at = ?
                 WHERE snapshot_date = ? AND sku = ?
                 """,
-                (warehouse_stock, dt.datetime.now().isoformat(timespec="seconds"), snapshot_date, sku)
+                rows,
             )
-            if cursor.rowcount > 0:
-                updated += 1
-    
-    conn.commit()
-    
-    # warehouse1과 warehouse2의 합계를 warehouse_stock에 업데이트
+        conn.commit()
+        updated = conn.total_changes - n0
+
     conn.execute(
         """
         UPDATE snapshots
         SET warehouse_stock = COALESCE(warehouse1_stock, 0) + COALESCE(warehouse2_stock, 0)
         WHERE snapshot_date = ?
         """,
-        (snapshot_date,)
+        (snapshot_date,),
     )
     conn.commit()
-    
+
     return updated
 
 

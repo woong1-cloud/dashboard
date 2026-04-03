@@ -1040,9 +1040,24 @@
               </div>
             </form>
 
+            {# chart_*_html: Plotly Figure JSON — 서버 to_json(), 클라이언트 Plotly.react #}
             {% if chart_sku_line_html %}
-              <div class="plotly-wrap mb-2">{{ chart_sku_line_html | safe }}</div>
-              <div class="plotly-wrap">{{ chart_sku_delta_html | safe }}</div>
+              <div id="chart-sku-line" class="plotly-wrap mb-2"></div>
+              <div id="chart-sku-delta" class="plotly-wrap"></div>
+              <script>
+              (function() {
+                try {
+                  var lineFig = {{ chart_sku_line_html | safe }};
+                  var deltaFig = {{ chart_sku_delta_html | safe }};
+                  if (typeof Plotly !== 'undefined' && lineFig && lineFig.data) {
+                    Plotly.react('chart-sku-line', lineFig.data, lineFig.layout, {responsive: true});
+                  }
+                  if (typeof Plotly !== 'undefined' && deltaFig && deltaFig.data) {
+                    Plotly.react('chart-sku-delta', deltaFig.data, deltaFig.layout, {responsive: true});
+                  }
+                } catch (e) { console.error('Plotly 차트:', e); }
+              })();
+              </script>
             {% else %}
               <div class="text-muted small">해당 SKU의 히스토리가 부족합니다. 다른 날짜로 데이터를 더 업로드하면 표시됩니다.</div>
             {% endif %}

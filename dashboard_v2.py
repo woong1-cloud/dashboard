@@ -9,10 +9,12 @@ import os
 import re
 from collections import defaultdict
 from functools import wraps
+from io import StringIO
 from typing import Any, Callable, Optional
 
 import pandas as pd
 import plotly.express as px
+import requests
 from flask import (
     Flask,
     abort,
@@ -24,11 +26,13 @@ from flask import (
     url_for,
     send_file,
 )
+from flask_caching import Cache
 
 from inventory_core import (
     avg_daily_usage_from_history,
     compute_daily_change,
     get_conn,
+    init_db,
     load_history,
     load_latest,
     normalize_excel,
@@ -38,6 +42,9 @@ from inventory_core import (
     update_warehouse_stock,
     update_distribution_note,
 )
+
+# [최적화] 뷰 단에서 Cache 인스턴스에 데코레이터 연결
+cache = Cache()
 
 
 APP_TITLE = "재고 대시보드 V4"
@@ -63,9 +70,10 @@ def _extract_spreadsheet_id(url_or_id: str) -> str:
 
 
 def fetch_gsheet_as_dataframe(url_or_id: str, sheet_name: str = "재고판매현황") -> pd.DataFrame:
+    # [최적화] 공개 CSV는 requests 타임아웃 + StringIO 파싱
     """구글 시트 → DataFrame
 
-    1차: 공개 시트 CSV export URL로 pd.read_csv() 시도
+    1차: 공개 시트 CSV export URL로 requests(타임아웃) + pd.read_csv(StringIO)
     2차(실패 시): 환경변수 GSHEET_SERVICE_ACCOUNT_PATH 또는
                   GSHEET_SERVICE_ACCOUNT_JSON 으로 gspread 서비스 계정 인증
     """
@@ -80,11 +88,13 @@ def fetch_gsheet_as_dataframe(url_or_id: str, sheet_name: str = "재고판매현
         f"/gviz/tq?tqx=out:csv&sheet={encoded_sheet}"
     )
     try:
-        df = pd.read_csv(csv_url)
+        resp = requests.get(csv_url, timeout=15)
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text))
         if df.empty:
             raise ValueError("시트가 비어 있습니다.")
         return df
-    except Exception as public_err:
+    except Exception:
         pass  # 비공개 시트면 아래 서비스 계정 방식으로 재시도
 
     # 서비스 계정 방식 (환경변수 설정 시)
@@ -135,11 +145,16 @@ DEPLOY_MODE = os.environ.get("DEPLOY_MODE", "").strip().lower() in ("1", "true",
 
 
 def create_app() -> Flask:
+    # [최적화] SimpleCache + DB 1회 초기화(init_db)
     """Flask 앱 생성 및 설정"""
     app = Flask(__name__)
     app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key-change-me-v2")
     app.config["PROPAGATE_EXCEPTIONS"] = True
     app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB 제한
+    app.config["CACHE_TYPE"] = "SimpleCache"
+    app.config["CACHE_DEFAULT_TIMEOUT"] = 300
+    cache.init_app(app)
+    init_db()
     return app
 
 
@@ -533,6 +548,7 @@ def gsheet_sync_post():
             session.pop("failed_count", None)
 
         sales_count = upsert_snapshot(conn, sales_snap)
+        cache.clear()
         flash(
             f"✅ DB 최신화 완료: 구글 시트 → {sales_count}개 품목 반영 (기준일 {date})",
             "success",
@@ -952,7 +968,8 @@ def upload_post():
         
         success_msg = f"✅ {', '.join(msg_parts)} 업로드 완료 (날짜: {date})"
         flash(success_msg, "success")
-        
+        cache.clear()
+
         # 실패한 행이 있으면 알림 (다운로드는 상단 배너에서 가능)
         if 'failed_count' in session and session['failed_count'] > 0:
             flash(f"⚠️ {session['failed_count']}개 행이 업로드 실패했습니다. 상단 배너에서 실패 목록을 다운로드하세요.", "warning")
@@ -982,7 +999,9 @@ def _status_badge(status: str) -> str:
 
 @app.get("/dashboard")
 @login_required
+@cache.cached(timeout=300, query_string=True, key_prefix="dashboard")
 def dashboard():
+    # [최적화] GET+쿼리스트링별 300초 캐시; 동기화/업로드/초기화 시 cache.clear()
     """대시보드 메인 화면"""
     try:
         return _dashboard_impl()
@@ -1256,6 +1275,7 @@ def _build_item_inventory_summary(
 
 
 def _dashboard_impl():
+    # [최적화] SKU 차트는 Plotly JSON + 템플릿에서 Plotly.react (서버 to_html 제거)
     """대시보드 로직 구현"""
     import numpy as np
     
@@ -1658,8 +1678,9 @@ def _dashboard_impl():
             fig_delta = px.bar(h.dropna(subset=["delta"]), x="snapshot_date", y="delta", title="일별 재고 증감")
             fig_delta.update_layout(height=250)
             
-            chart_sku_line_html = fig_line.to_html(full_html=False, include_plotlyjs=False)
-            chart_sku_delta_html = fig_delta.to_html(full_html=False, include_plotlyjs=False)
+            # 템플릿: Plotly.react('chart-sku-line', fig.data, fig.layout) — chart_*_html은 JSON 문자열
+            chart_sku_line_html = fig_line.to_json()
+            chart_sku_delta_html = fig_delta.to_json()
     
     # 전체 KPI (상단 고정용)
     kpi_all = {
@@ -1776,6 +1797,7 @@ def clear_data():
             conn = get_conn()
             conn.execute("DELETE FROM snapshots")
             conn.commit()
+            cache.clear()
             flash("✅ 모든 데이터가 삭제되었습니다.", "success")
             return redirect(url_for("dashboard"))
         except Exception as e:

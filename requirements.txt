@@ -1,6 +1,7 @@
 pandas
 openpyxl
 flask
+flask-caching
 requests
 plotly
 gunicorn

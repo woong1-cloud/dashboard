@@ -20,6 +20,7 @@ try:
     from inventory_core import (
         compute_daily_change,
         get_conn,
+        init_db,
         load_history,
         load_latest,
         normalize_excel,
@@ -28,6 +29,8 @@ try:
         update_warehouse_stock,
         upsert_snapshot,
     )
+
+    init_db()
 except Exception as e:
     _import_error = (e, traceback.format_exc())
 
