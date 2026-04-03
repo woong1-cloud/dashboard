@@ -42,6 +42,13 @@ from inventory_core import (
 APP_TITLE = "재고 대시보드 V4"
 DEFAULT_PASSWORD = "1234"
 
+# DB에 gsheet_url이 없을 때 업로드 폼·동기화에 쓰는 기본 스프레드시트
+DEFAULT_GSHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1lphWwIG146kEZBxVP5_STqFDH7yOxeZHI4tXpedgT3g/edit?usp=sharing"
+)
+DEFAULT_GSHEET_SHEET = "재고판매현황"
+
 
 # ---------------------------------------------------------------------------
 # 구글 시트 헬퍼
@@ -170,7 +177,7 @@ def inject_deploy_config():
 
 @app.context_processor
 def inject_gsheet_sync_nav():
-    """네비 DB 최신화 버튼용: 오늘 날짜·구글 시트 저장 여부"""
+    """네비 DB 최신화 버튼용: 오늘 날짜·동기화 가능 URL(기본값 포함) 여부"""
     st = _get_gsheet_settings()
     return {
         "gsheet_sync_snapshot_default": dt.date.today().isoformat(),
@@ -187,17 +194,20 @@ def test():
 
 
 def _get_gsheet_settings() -> dict:
-    """DB에서 구글 시트 연동 설정(url, sheet) 조회"""
+    """구글 시트 설정. DB에 URL이 없으면 DEFAULT_GSHEET_* 로 채움. saved=DB에 URL이 있는지."""
+    url_db, sheet_db = "", ""
     try:
         conn = get_conn()
         cur = conn.execute("SELECT key, value FROM settings WHERE key IN ('gsheet_url', 'gsheet_sheet')")
         rows = {row[0]: row[1] for row in cur.fetchall()}
-        return {
-            "url": rows.get("gsheet_url", ""),
-            "sheet": rows.get("gsheet_sheet", "재고판매현황"),
-        }
+        url_db = (rows.get("gsheet_url") or "").strip()
+        sheet_db = (rows.get("gsheet_sheet") or "").strip()
     except Exception:
-        return {"url": "", "sheet": "재고판매현황"}
+        pass
+    saved = bool(url_db)
+    sheet = sheet_db or DEFAULT_GSHEET_SHEET
+    url = url_db or DEFAULT_GSHEET_URL
+    return {"url": url, "sheet": sheet, "saved": saved}
 
 
 def _set_gsheet_settings(url: str, sheet: str) -> None:
@@ -563,7 +573,7 @@ def upload_post():
     # 필수 소스 검증
     if sales_source == "gsheet":
         if not gsheet_input:
-            flash("구글 시트 URL 또는 스프레드시트 ID를 입력하세요. 먼저 설정을 저장해 주세요.", "danger")
+            flash("구글 시트 URL을 확인할 수 없습니다. 업로드 페이지에서 주소를 저장하거나 다시 시도해 주세요.", "danger")
             return redirect(url_for("upload_get"))
     else:
         if not sales_file or not sales_file.filename:

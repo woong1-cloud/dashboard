@@ -4,8 +4,20 @@
     <div class="card border-0 shadow-sm">
       <div class="card-body p-4">
         <h2 class="h5 fw-semibold mb-2">데이터가 없습니다</h2>
-        <p class="text-muted mb-3">먼저 엑셀을 업로드하면 대시보드가 생성됩니다.</p>
-        <a class="btn btn-primary" href="{{ url_for('upload_get') }}">엑셀 업로드로 이동</a>
+        <p class="text-muted mb-3">엑셀·구글 시트로 데이터를 넣으면 대시보드가 생성됩니다.</p>
+        <div class="d-flex flex-wrap gap-2 align-items-center">
+          <a class="btn btn-primary" href="{{ url_for('upload_get') }}">엑셀·업로드로 이동</a>
+          {% if session.get('authed') and has_gsheet_saved %}
+          <form method="post" action="{{ url_for('gsheet_sync_post') }}" class="d-inline"
+                title="저장된 구글 시트(또는 기본 시트)를 읽어 오늘 날짜 스냅샷으로 DB에 반영합니다.">
+            <input type="hidden" name="snapshot_date" value="{{ gsheet_sync_snapshot_default }}" />
+            <button type="submit" class="btn btn-success">
+              <i class="bi bi-arrow-repeat"></i> DB 최신화
+            </button>
+          </form>
+          {% endif %}
+        </div>
+        <p class="text-muted small mt-3 mb-0">DB 최신화는 구글 시트(기본 URL 포함)에서 1번 상품분석 데이터만 반영합니다. 물류·매장 엑셀은 업로드 페이지에서 올려 주세요.</p>
       </div>
     </div>
   </div>
