@@ -117,6 +117,26 @@ tr.row-reorder td {
   border-radius: 4px;
 }
 
+/* 대시보드 앵커: 스크롤 복원 시 상단 네비에 가리지 않도록 */
+#sec-high-risk,
+#sec-filter-panel,
+#sec-item-inventory,
+#sec-sku-chart {
+  scroll-margin-top: 4.5rem;
+}
+
+/* 상품명: 한글 줄바꿈·접미사(_영문) 생략은 product_name_ui 필터, 전체는 title 툴팁 */
+.table .cell-product-name {
+  white-space: normal;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  min-width: 12rem;
+  max-width: 28rem;
+  line-height: 1.4;
+  vertical-align: middle;
+  color: #000;
+}
+
 .table-responsive::-webkit-scrollbar-thumb:hover {
   background: rgba(148, 163, 184, 0.7);
 }

@@ -367,9 +367,9 @@
     document.addEventListener('DOMContentLoaded', function() { switchCatStats('all'); });
     </script>
 
-    <!-- 위험 SKU 써머리 -->
+    <!-- 위험 SKU 써머리 (스크롤 앵커: 복종 필터 재로딩 후 이 구간으로 이동) -->
     {% if high_risk_summary %}
-    <div class="card shadow-sm border-danger mb-3">
+    <div class="card shadow-sm border-danger mb-3" id="sec-high-risk">
       <div class="card-header bg-danger text-white">
         <div class="d-flex align-items-center justify-content-between">
           <div class="flex-grow-1">
@@ -396,7 +396,7 @@
                     target_cover_days=selected.target_cover_days,
                     sku=selected.sku,
                     item_tab=selected.item_tab
-                  ) }}" 
+                  ) }}#sec-high-risk" 
                   class="btn {% if uc == selected.urgent_category %}btn-light{% else %}btn-outline-light{% endif %}"
                   style="
                     font-size: 0.75rem; 
@@ -435,7 +435,7 @@
                 <th class="sortable" style="padding: 0.4rem 0.5rem;">상태</th>
                 <th class="sortable" style="padding: 0.4rem 0.5rem;">상품코드</th>
                 <th class="sortable" style="padding: 0.4rem 0.5rem;">SKU</th>
-                <th class="sortable" style="padding: 0.4rem 0.5rem;">상품명</th>
+                <th class="sortable cell-product-name" style="padding: 0.4rem 0.5rem; min-width: 12rem;">상품명</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">일평균판매</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">현재재고</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem; background-color: #e0f2fe; color: #075985; font-weight: 600;">매장<br>재고</th>
@@ -464,7 +464,7 @@
                       <span class="badge bg-danger ms-1" style="font-size: 0.65rem;">오류</span>
                     {% endif %}
                   </td>
-                  <td class="text-truncate" style="max-width: 130px; padding: 0.4rem 0.5rem; color: #000;">{{ r.name or "" }}</td>
+                  <td class="cell-product-name" style="padding: 0.4rem 0.5rem;" title="{{ (r.name or '')|e }}">{{ (r.name or "")|product_name_ui }}</td>
                   <td class="text-end fw-semibold" style="padding: 0.4rem 0.5rem; color: #2563eb;">{{ "%.1f"|format(r.daily_sales_7d) }}</td>
                   <td class="text-end" style="padding: 0.4rem 0.5rem; color: #000;">{{ "{:,}".format(r.stock) }}</td>
                   <td class="text-end fw-semibold" style="padding: 0.4rem 0.5rem; background-color: rgba(224, 242, 254, 0.4); color: #0369a1;">{{ "{:,}".format(r.channel_stock) }}</td>
@@ -489,9 +489,9 @@
     {% endif %}
 
     <!-- 필터 영역 (컴팩트 디자인) -->
-    <div class="card shadow-sm border-0 mb-3">
+    <div class="card shadow-sm border-0 mb-3" id="sec-filter-panel">
       <div class="card-body p-3">
-        <form method="get" action="{{ url_for('dashboard') }}">
+        <form id="dash-filter-form" method="get" action="{{ url_for('dashboard') }}">
           <input type="hidden" name="item_tab" value="{{ selected.item_tab }}" />
           <!-- 첫 번째 줄 -->
           <div class="row g-2 mb-2">
@@ -680,7 +680,7 @@
                     <th class="sortable" style="padding: 0.4rem 0.5rem;">상태</th>
                     <th class="sortable" style="padding: 0.4rem 0.5rem;">상품코드</th>
                     <th class="sortable" style="padding: 0.4rem 0.5rem;">SKU</th>
-                    <th class="sortable" style="padding: 0.4rem 0.5rem;">상품명</th>
+                    <th class="sortable cell-product-name" style="padding: 0.4rem 0.5rem; min-width: 12rem;">상품명</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">일평균<br>판매</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">현재<br>재고</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem; background-color: #e0f2fe; color: #075985; font-weight: 600;">매장<br>재고</th>
@@ -708,7 +708,7 @@
                           <span class="badge bg-danger ms-1" style="font-size: 0.65rem;">오류</span>
                         {% endif %}
                       </td>
-                      <td class="text-truncate" style="max-width: 150px; padding: 0.4rem 0.5rem; color: #000;">{{ r.name or "" }}</td>
+                      <td class="cell-product-name" style="padding: 0.4rem 0.5rem;" title="{{ (r.name or '')|e }}">{{ (r.name or "")|product_name_ui }}</td>
                       <td class="text-end fw-semibold" style="padding: 0.4rem 0.5rem; color: #2563eb;">{{ "%.1f"|format(r.daily_sales_7d) }}</td>
                       <td class="text-end" style="padding: 0.4rem 0.5rem; color: #000;">{{ "{:,}".format(r.stock) }}</td>
                       <td class="text-end fw-semibold" style="padding: 0.4rem 0.5rem; background-color: rgba(224, 242, 254, 0.4); color: #0369a1;">{{ "{:,}".format(r.channel_stock) }}</td>
@@ -813,8 +813,8 @@
                       <td class="small" style="padding: 0.4rem 0.5rem;">
                         <span class="text-muted">{{ r.style_code }}</span>
                       </td>
-                      <td class="small text-truncate" style="padding: 0.4rem 0.5rem; max-width: 220px;" title="{{ r.style_name or '' }}">
-                        <span style="color: #000;">{{ r.style_name or "—" }}</span>
+                      <td class="small cell-product-name" style="padding: 0.4rem 0.5rem;" title="{{ (r.style_name or '')|e }}">
+                        <span style="color: #000;">{{ ((r.style_name or "")|product_name_ui) or "—" }}</span>
                       </td>
                       <td class="small" style="padding: 0.4rem 0.5rem;">
                         <span class="fw-semibold" style="color: #000;">{{ r.sku_code }}</span>
@@ -846,7 +846,7 @@
       </div>
 
       <div class="col-12">
-        <div class="card shadow-sm border-0">
+        <div class="card shadow-sm border-0" id="sec-item-inventory">
           <div class="card-body">
             <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
               <div class="flex-grow-1">
@@ -1013,8 +1013,8 @@
             </div>
 
             <hr class="text-secondary opacity-25 my-3" />
-            <div class="small fw-semibold text-muted mb-2">SKU 일자별 재고 추이</div>
-            <form method="get" action="{{ url_for('dashboard') }}" class="row g-2 align-items-end mb-2">
+            <div class="small fw-semibold text-muted mb-2" id="sec-sku-chart">SKU 일자별 재고 추이</div>
+            <form id="dash-sku-form" method="get" action="{{ url_for('dashboard') }}" class="row g-2 align-items-end mb-2">
               <input type="hidden" name="item_tab" value="{{ selected.item_tab }}" />
               <input type="hidden" name="category" value="{{ selected.category }}" />
               {% for sc in selected.season_codes %}
@@ -1053,13 +1053,49 @@
   </div>
 
   <script>
+    /**
+     * 시즌 탭: 전체 새로고침은 유지(서버가 item_summary 재계산).
+     * 스크롤은 URL 해시(#sec-item-inventory)로 복귀 — fetch로 HTML 일부만 바꾸는 방식은
+     * 템플릿·세션·정렬 상태 중복이 커서 동일 서버비용·구현비 대비 이 방식이 효율적.
+     */
     function goItemTab(tab) {
       var u = new URL(window.location.href);
       u.searchParams.set('item_tab', tab);
+      u.hash = 'sec-item-inventory';
       window.location.href = u.toString();
     }
-    // Bootstrap 툴팁 초기화
+    function dashScrollRestore() {
+      var sid = sessionStorage.getItem('dashScrollAnchor');
+      if (sid) {
+        sessionStorage.removeItem('dashScrollAnchor');
+        var saved = document.getElementById(sid);
+        if (saved) {
+          saved.scrollIntoView({ block: 'start', behavior: 'auto' });
+          return;
+        }
+      }
+      if (location.hash && location.hash.length > 1) {
+        var id = location.hash.slice(1);
+        var el = document.getElementById(id);
+        if (el) {
+          el.scrollIntoView({ block: 'start', behavior: 'auto' });
+        }
+      }
+    }
     document.addEventListener('DOMContentLoaded', function () {
+      dashScrollRestore();
+      var ff = document.getElementById('dash-filter-form');
+      if (ff) {
+        ff.addEventListener('submit', function () {
+          sessionStorage.setItem('dashScrollAnchor', 'sec-filter-panel');
+        });
+      }
+      var sf = document.getElementById('dash-sku-form');
+      if (sf) {
+        sf.addEventListener('submit', function () {
+          sessionStorage.setItem('dashScrollAnchor', 'sec-sku-chart');
+        });
+      }
       const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
       tooltipTriggerList.map(function (tooltipTriggerEl) {
         return new bootstrap.Tooltip(tooltipTriggerEl);
@@ -1139,6 +1175,19 @@
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;');
         }
+        function displayProductNameUi(raw) {
+          const s = String(raw || '').trim();
+          if (!s) return '';
+          const hangul = /[가-힣ㄱ-ㅎㅏ-ㅣ]/;
+          const idx = s.lastIndexOf('_');
+          if (idx > 0) {
+            const tail = s.slice(idx + 1);
+            if (tail && !hangul.test(tail)) {
+              return s.slice(0, idx).replace(/\s+$/, '');
+            }
+          }
+          return s;
+        }
         function fillSkuTable(tbodyId, rows, emptyMsg) {
           const el = document.getElementById(tbodyId);
           if (!rows.length) {
@@ -1147,12 +1196,13 @@
           }
           el.innerHTML = rows.map((r, idx) => {
             const nameRaw = (r.name || '').toString();
-            const nameDisp = nameRaw.trim() ? escHtml(nameRaw) : '-';
+            const nameUi = displayProductNameUi(nameRaw);
+            const nameDisp = nameUi ? escHtml(nameUi) : '-';
             return `
               <tr>
                 <td class="text-center text-muted">${idx + 1}</td>
                 <td class="fw-semibold">${escHtml(r.sku || '-')}</td>
-                <td class="text-truncate" style="max-width: 180px;" title="${escAttr(nameRaw)}">${nameDisp}</td>
+                <td class="cell-product-name" title="${escAttr(nameRaw)}">${nameDisp}</td>
                 <td class="text-end">${escHtml(r.season_code || '-')}</td>
                 <td class="text-end">${Number(r.sales_qty || 0).toLocaleString()}</td>
                 <td class="text-end fw-semibold">${Number(r.stock || 0).toLocaleString()}</td>

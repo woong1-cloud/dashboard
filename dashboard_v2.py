@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 from collections import defaultdict
 from functools import wraps
 from typing import Any, Callable, Optional
@@ -143,6 +144,26 @@ def create_app() -> Flask:
 
 
 app = create_app()
+
+# 표시용 상품명: 마지막 `_` 뒤에 한글이 없으면(영문·숫자·기호 접미사로 간주) 해당 `_…` 구간 제거
+_HANGUL_IN_PRODUCT = re.compile(r"[가-힣ㄱ-ㅎㅏ-ㅣ]")
+
+
+def display_product_name_ui(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    idx = s.rfind("_")
+    if idx > 0:
+        tail = s[idx + 1 :]
+        if tail and not _HANGUL_IN_PRODUCT.search(tail):
+            return s[:idx].rstrip()
+    return s
+
+
+app.jinja_env.filters["product_name_ui"] = display_product_name_ui
 
 
 @app.errorhandler(500)
