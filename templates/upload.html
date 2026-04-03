@@ -43,23 +43,117 @@
       </div>
 
       <!-- 1. 상품분석판매 -->
+      <input type="hidden" name="sales_source" id="sales_source" value="file" />
       <div class="card shadow-sm border-primary border-2 mb-3">
-        <div class="card-header bg-primary text-white">
+        <div class="card-header bg-primary text-white d-flex align-items-center justify-content-between flex-wrap gap-2">
           <h3 class="h6 mb-0">
             <i class="bi bi-cart-check-fill"></i>
-            <strong>1. 상품분석판매 데이터</strong> (필수)
+            <strong>1. 상품분석판매 데이터</strong> <span class="fw-normal opacity-75">(필수)</span>
           </h3>
+          <!-- 소스 선택 탭 버튼 -->
+          <div class="btn-group btn-group-sm" role="group" id="salesSourceBtns">
+            <button type="button" class="btn btn-light active" id="btnFile" onclick="switchSalesSource('file')">
+              <i class="bi bi-file-earmark-arrow-up"></i> 파일 업로드
+            </button>
+            <button type="button" class="btn btn-light" id="btnGsheet" onclick="switchSalesSource('gsheet')">
+              <i class="bi bi-google"></i> 구글 시트 연동
+            </button>
+          </div>
         </div>
         <div class="card-body p-4">
-          <div class="alert alert-info mb-3">
-            <strong>📁 파일 형식:</strong> CSV (.csv)<br>
-            <strong>📋 포함 내용:</strong> 상품명, 옵션, 현재재고, 판매수량<br>
-            <strong>🎯 결과:</strong> SKU 생성 + 판매량 분석
+
+          <!-- 파일 업로드 패널 -->
+          <div id="panelFile">
+            <div class="alert alert-info mb-3">
+              <strong>📁 파일 형식:</strong> CSV (.csv) / Excel (.xlsx)<br>
+              <strong>📋 포함 내용:</strong> 상품명, 옵션, 현재재고, 판매수량<br>
+              <strong>🎯 결과:</strong> SKU 생성 + 판매량 분석
+            </div>
+            <label class="form-label fw-semibold">파일 선택 <span class="text-danger">*</span></label>
+            <input class="form-control form-control-lg" type="file" name="sales_file" id="sales_file"
+                   accept=".csv,.xlsx,.xls,.xlsb" />
+            <div class="form-text">예: 20260129_091301_ProductPrdchart.csv</div>
           </div>
-          
-          <label class="form-label fw-semibold">CSV 파일 선택 <span class="text-danger">*</span></label>
-          <input class="form-control form-control-lg" type="file" name="sales_file" accept=".csv" required />
-          <div class="form-text">예: 20260129_091301_ProductPrdchart.csv</div>
+
+          <!-- 구글 시트 패널 -->
+          <div id="panelGsheet" style="display:none;">
+
+            {% if gsheet_settings and gsheet_settings.url %}
+            {# ── 상태 A: URL이 이미 저장된 경우 ── #}
+            <div class="d-flex align-items-start gap-3 p-3 rounded-3 mb-3"
+                 style="background:rgba(25,135,84,.08); border:1px solid rgba(25,135,84,.25);">
+              <div class="flex-shrink-0 mt-1">
+                <span class="badge bg-success fs-6 px-2 py-1"><i class="bi bi-check-circle-fill"></i> 연동 설정됨</span>
+              </div>
+              <div class="flex-grow-1">
+                <div class="fw-semibold text-success mb-1">
+                  시트: <code>{{ gsheet_settings.sheet }}</code>
+                </div>
+                <div class="text-muted small text-break">
+                  {{ gsheet_settings.url[:60] }}{% if gsheet_settings.url|length > 60 %}…{% endif %}
+                </div>
+              </div>
+              <div class="flex-shrink-0">
+                <button type="button" class="btn btn-sm btn-outline-secondary"
+                        onclick="toggleGsheetEdit()" id="btnEditGsheet">
+                  <i class="bi bi-pencil"></i> 변경
+                </button>
+              </div>
+            </div>
+
+            {# 업로드 폼에 사용할 hidden 값 (이미 저장된 URL/시트 자동 사용) #}
+            <input type="hidden" name="gsheet_input" id="gsheet_input" value="" />
+            <input type="hidden" name="gsheet_sheet" id="gsheet_sheet" value="" />
+
+            {# 설정 변경 영역 (기본 숨김, "변경" 버튼 클릭 시 표시) — 중첩 form 금지이므로 AJAX 사용 #}
+            <div id="gsheetEditForm" style="display:none;">
+              <hr class="my-3">
+              <p class="text-muted small mb-3"><i class="bi bi-info-circle"></i> 새 URL/시트를 저장하면 즉시 반영됩니다.</p>
+              <div class="mb-2">
+                <label class="form-label fw-semibold small">스프레드시트 URL 또는 ID</label>
+                <input class="form-control" type="text" id="gsheetEditUrl"
+                       value="{{ gsheet_settings.url }}" placeholder="https://docs.google.com/spreadsheets/d/..." />
+              </div>
+              <div class="mb-3">
+                <label class="form-label fw-semibold small">시트명</label>
+                <input class="form-control" type="text" id="gsheetEditSheet"
+                       value="{{ gsheet_settings.sheet }}" placeholder="재고판매현황" />
+              </div>
+              <button class="btn btn-success btn-sm" type="button" onclick="saveGsheetSettings('edit')">
+                <i class="bi bi-save"></i> 저장
+              </button>
+              <button class="btn btn-outline-secondary btn-sm ms-2" type="button"
+                      onclick="toggleGsheetEdit()">취소</button>
+            </div>
+
+            {% else %}
+            {# ── 상태 B: URL이 저장되지 않은 경우 — 중첩 form 금지이므로 AJAX 사용 ── #}
+            <div class="alert alert-warning mb-3 py-2">
+              <i class="bi bi-exclamation-triangle"></i>
+              구글 시트 URL을 아직 저장하지 않았습니다. 아래에 입력 후 <strong>저장</strong>하면 다음부터는 클릭 한 번으로 가져올 수 있습니다.
+            </div>
+            <div class="mb-3">
+              <label class="form-label fw-semibold">스프레드시트 URL 또는 ID <span class="text-danger">*</span></label>
+              <input class="form-control form-control-lg" type="text" id="gsheetNewUrl"
+                     placeholder="https://docs.google.com/spreadsheets/d/... 또는 ID만 입력" />
+              <div class="form-text">예: 1lphWwIG146kEZBxVP5_STqFDH7yOxeZHI4tXpedgT3g</div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label fw-semibold">시트명</label>
+              <input class="form-control" type="text" id="gsheetNewSheet"
+                     value="재고판매현황" placeholder="재고판매현황" />
+              <div class="form-text">데이터가 들어있는 시트 탭 이름 (기본값: 재고판매현황)</div>
+            </div>
+            <button class="btn btn-success" type="button" onclick="saveGsheetSettings('new')">
+              <i class="bi bi-save"></i> 저장하고 연동 시작
+            </button>
+            {# 업로드 폼 hidden — DB에서 자동 로드되므로 비워둠 #}
+            <input type="hidden" name="gsheet_input" value="" />
+            <input type="hidden" name="gsheet_sheet" value="" />
+            {% endif %}
+
+          </div>
+
         </div>
       </div>
 
@@ -279,4 +373,99 @@
       </div>
     </div>
   </div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function switchSalesSource(source) {
+  document.getElementById('sales_source').value = source;
+
+  const filePanel   = document.getElementById('panelFile');
+  const gsheetPanel = document.getElementById('panelGsheet');
+  const btnFile     = document.getElementById('btnFile');
+  const btnGsheet   = document.getElementById('btnGsheet');
+  const fileInput   = document.getElementById('sales_file');
+  const gsheetInput = document.getElementById('gsheet_input');
+
+  if (source === 'gsheet') {
+    filePanel.style.display   = 'none';
+    gsheetPanel.style.display = '';
+    btnFile.classList.remove('active');
+    btnGsheet.classList.add('active');
+    fileInput.removeAttribute('required');
+    gsheetInput.setAttribute('required', 'required');
+  } else {
+    filePanel.style.display   = '';
+    gsheetPanel.style.display = 'none';
+    btnGsheet.classList.remove('active');
+    btnFile.classList.add('active');
+    gsheetInput.removeAttribute('required');
+    fileInput.setAttribute('required', 'required');
+  }
+}
+
+function toggleGsheetEdit() {
+  const form = document.getElementById('gsheetEditForm');
+  const btn  = document.getElementById('btnEditGsheet');
+  if (!form) return;
+  const isHidden = form.style.display === 'none';
+  form.style.display = isHidden ? '' : 'none';
+  if (btn) btn.innerHTML = isHidden
+    ? '<i class="bi bi-x"></i> 취소'
+    : '<i class="bi bi-pencil"></i> 변경';
+}
+
+async function saveGsheetSettings(mode) {
+  const urlEl   = mode === 'edit'
+    ? document.getElementById('gsheetEditUrl')
+    : document.getElementById('gsheetNewUrl');
+  const sheetEl = mode === 'edit'
+    ? document.getElementById('gsheetEditSheet')
+    : document.getElementById('gsheetNewSheet');
+
+  const url   = (urlEl?.value   || '').trim();
+  const sheet = (sheetEl?.value || '재고판매현황').trim() || '재고판매현황';
+
+  if (!url) {
+    alert('스프레드시트 URL 또는 ID를 입력하세요.');
+    urlEl?.focus();
+    return;
+  }
+
+  const btn = event.currentTarget;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> 저장 중…';
+
+  try {
+    const fd = new FormData();
+    fd.append('gsheet_url', url);
+    fd.append('gsheet_sheet', sheet);
+
+    const resp = await fetch('{{ url_for("settings_gsheet_save") }}', {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      body: fd,
+    });
+    const data = await resp.json();
+
+    if (data.ok) {
+      window.location.reload();
+    } else {
+      alert('저장 실패: ' + (data.error || '알 수 없는 오류'));
+      btn.disabled = false;
+      btn.innerHTML = '<i class="bi bi-save"></i> 저장하고 연동 시작';
+    }
+  } catch (e) {
+    alert('요청 오류: ' + e.message);
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-save"></i> 저장하고 연동 시작';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+  // URL이 저장된 경우 기본 탭을 구글 시트로 설정
+  const hasSavedUrl = {{ 'true' if gsheet_settings and gsheet_settings.url else 'false' }};
+  switchSalesSource(hasSavedUrl ? 'gsheet' : 'file');
+});
+</script>
 {% endblock %}

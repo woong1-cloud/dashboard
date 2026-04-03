@@ -104,6 +104,7 @@ def normalize_excel(df: pd.DataFrame, snapshot_date: dt.date, return_failed: boo
         "SKU": "sku",
         "자체 품목코드": "sku",  # 이전 형식 지원
         "상품 품목코드": "product_item_code",  # 새 형식: 임시 저장
+        "품목코드(15자리)": "sku",  # 구글시트 재고판매현황 등: 완성 SKU
         "상품": "sku_raw",  # 엑셀2 F열: SKU (15-16자리)
         "상품코드": "sku",  # 매장재고 엑셀: 상품코드
         "name": "name",
@@ -118,6 +119,7 @@ def normalize_excel(df: pd.DataFrame, snapshot_date: dt.date, return_failed: boo
         "현재재고": "stock",
         "재고수량": "stock",
         "판매수량": "sales_qty",  # 새 형식: 7일 판매량
+        "기간내 판매수량": "sales_qty",  # API/시트: 조회기간 합계 판매
         "결제수량": "order_qty",
         "환불수량": "refund_qty",
         "가용재고": "channel_stock",  # 매장재고 엑셀: 가용재고
@@ -148,8 +150,9 @@ def normalize_excel(df: pd.DataFrame, snapshot_date: dt.date, return_failed: boo
         df["sku"] = df["sku_raw"].astype(str).str.strip().str[:15]
     
     # 새 형식: SKU 생성 (상품코드 10자리 + E열 컬러 + E열 사이즈)
-    # option 컬럼이 있으면 무조건 SKU 재생성 (기존 sku 컬럼이 상품 코드만 포함하고 옵션 정보가 없을 수 있음)
-    if "option" in df.columns:
+    # 이미 파일에 완성 sku(예: 품목코드(15자리))가 있으면 덮어쓰지 않음 — 옵션 형식이
+    # "Color : … / Size : …"가 아닌 "(10)WHITE / S(085)" 등인 시트는 extract_sku가 실패함
+    if "option" in df.columns and "sku" not in df.columns:
         import re
         
         def extract_sku(row):

@@ -1,5 +1,5 @@
 """
-재고 대시보드 V3 (Flask, 진입 파일명 dashboard_v2.py 유지)
+재고 대시보드 V4 (Flask, 진입 파일명 dashboard_v2.py 유지)
 포트(로컬): 5003
 """
 from __future__ import annotations
@@ -39,8 +39,88 @@ from inventory_core import (
 )
 
 
-APP_TITLE = "재고 대시보드 V3"
+APP_TITLE = "재고 대시보드 V4"
 DEFAULT_PASSWORD = "1234"
+
+
+# ---------------------------------------------------------------------------
+# 구글 시트 헬퍼
+# ---------------------------------------------------------------------------
+
+def _extract_spreadsheet_id(url_or_id: str) -> str:
+    """URL 또는 ID 문자열에서 구글 스프레드시트 ID 추출"""
+    import re
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url_or_id)
+    return m.group(1) if m else url_or_id.strip()
+
+
+def fetch_gsheet_as_dataframe(url_or_id: str, sheet_name: str = "재고판매현황") -> pd.DataFrame:
+    """구글 시트 → DataFrame
+
+    1차: 공개 시트 CSV export URL로 pd.read_csv() 시도
+    2차(실패 시): 환경변수 GSHEET_SERVICE_ACCOUNT_PATH 또는
+                  GSHEET_SERVICE_ACCOUNT_JSON 으로 gspread 서비스 계정 인증
+    """
+    import urllib.parse
+
+    spreadsheet_id = _extract_spreadsheet_id(url_or_id)
+    encoded_sheet = urllib.parse.quote(sheet_name)
+
+    # 공개 시트 CSV 방식
+    csv_url = (
+        f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+        f"/gviz/tq?tqx=out:csv&sheet={encoded_sheet}"
+    )
+    try:
+        df = pd.read_csv(csv_url)
+        if df.empty:
+            raise ValueError("시트가 비어 있습니다.")
+        return df
+    except Exception as public_err:
+        pass  # 비공개 시트면 아래 서비스 계정 방식으로 재시도
+
+    # 서비스 계정 방식 (환경변수 설정 시)
+    sa_path = os.environ.get("GSHEET_SERVICE_ACCOUNT_PATH", "").strip()
+    sa_json_str = os.environ.get("GSHEET_SERVICE_ACCOUNT_JSON", "").strip()
+
+    if not sa_path and not sa_json_str:
+        raise ValueError(
+            "구글 시트 읽기에 실패했습니다. "
+            "시트가 '링크가 있는 누구나 볼 수 있음'으로 공유되어 있는지 확인하거나, "
+            "비공개 시트라면 환경변수 GSHEET_SERVICE_ACCOUNT_PATH 또는 "
+            "GSHEET_SERVICE_ACCOUNT_JSON 을 설정하세요."
+        )
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        raise ValueError(
+            "비공개 시트 접근을 위해 'pip install gspread google-auth' 가 필요합니다."
+        )
+
+    scopes = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    try:
+        if sa_json_str:
+            import json
+            creds = Credentials.from_service_account_info(
+                json.loads(sa_json_str), scopes=scopes
+            )
+        else:
+            creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
+
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(spreadsheet_id)
+        ws = sh.worksheet(sheet_name)
+        data = ws.get_all_records()
+        if not data:
+            raise ValueError("시트가 비어 있습니다.")
+        return pd.DataFrame(data)
+    except Exception as sa_err:
+        raise ValueError(f"서비스 계정으로 구글 시트 읽기 실패: {sa_err}")
 
 # 팀 배포 모드: True면 초기화 기능 비활성화, /test 비노출, 500 에러 시 상세 미표시
 DEPLOY_MODE = os.environ.get("DEPLOY_MODE", "").strip().lower() in ("1", "true", "yes")
@@ -88,12 +168,46 @@ def inject_deploy_config():
     return {"show_clear_data": not DEPLOY_MODE}
 
 
+@app.context_processor
+def inject_gsheet_sync_nav():
+    """네비 DB 최신화 버튼용: 오늘 날짜·구글 시트 저장 여부"""
+    st = _get_gsheet_settings()
+    return {
+        "gsheet_sync_snapshot_default": dt.date.today().isoformat(),
+        "has_gsheet_saved": bool((st.get("url") or "").strip()),
+    }
+
+
 @app.route("/test")
 def test():
     """서버 상태 확인 (배포 모드에서는 비노출)"""
     if DEPLOY_MODE:
         abort(404)
-    return "<h1>OK</h1><p>✅ 대시보드 V3 서버 정상 작동중 (포트: 5003)</p>"
+    return "<h1>OK</h1><p>✅ 대시보드 V4 서버 정상 작동중 (포트: 5003)</p>"
+
+
+def _get_gsheet_settings() -> dict:
+    """DB에서 구글 시트 연동 설정(url, sheet) 조회"""
+    try:
+        conn = get_conn()
+        cur = conn.execute("SELECT key, value FROM settings WHERE key IN ('gsheet_url', 'gsheet_sheet')")
+        rows = {row[0]: row[1] for row in cur.fetchall()}
+        return {
+            "url": rows.get("gsheet_url", ""),
+            "sheet": rows.get("gsheet_sheet", "재고판매현황"),
+        }
+    except Exception:
+        return {"url": "", "sheet": "재고판매현황"}
+
+
+def _set_gsheet_settings(url: str, sheet: str) -> None:
+    """DB에 구글 시트 연동 설정 저장"""
+    conn = get_conn()
+    conn.executemany(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        [("gsheet_url", url.strip()), ("gsheet_sheet", (sheet or "재고판매현황").strip())],
+    )
+    conn.commit()
 
 
 def _get_password_from_db() -> str:
@@ -317,14 +431,104 @@ def root():
     return redirect(url_for("dashboard"))
 
 
+@app.post("/settings/gsheet")
+@login_required
+def settings_gsheet_save():
+    """구글 시트 연동 URL 설정 저장 (일반 폼 요청 + AJAX 공용)"""
+    from flask import jsonify
+
+    is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
+
+    gsheet_url = (request.form.get("gsheet_url") or "").strip()
+    gsheet_sheet = (request.form.get("gsheet_sheet") or "재고판매현황").strip() or "재고판매현황"
+
+    if not gsheet_url:
+        if is_ajax:
+            return jsonify(ok=False, error="URL 또는 ID를 입력하세요."), 400
+        flash("스프레드시트 URL 또는 ID를 입력하세요.", "danger")
+        return redirect(url_for("upload_get"))
+
+    try:
+        _set_gsheet_settings(gsheet_url, gsheet_sheet)
+        if is_ajax:
+            return jsonify(ok=True)
+        flash("✅ 구글 시트 연동 설정이 저장되었습니다.", "success")
+    except Exception as e:
+        if is_ajax:
+            return jsonify(ok=False, error=str(e)), 500
+        flash(f"설정 저장 실패: {e}", "danger")
+
+    return redirect(url_for("upload_get"))
+
+
+@app.post("/sync/gsheet")
+@login_required
+def gsheet_sync_post():
+    """저장된 구글 시트에서 1번(상품분석판매)만 읽어 해당 스냅샷 날짜로 DB 갱신"""
+    saved = _get_gsheet_settings()
+    url = (saved.get("url") or "").strip()
+    sheet = (saved.get("sheet") or "재고판매현황").strip() or "재고판매현황"
+    if not url:
+        flash("구글 시트 연동 URL이 없습니다. 업로드 페이지에서 먼저 저장하세요.", "danger")
+        return redirect(request.referrer or url_for("dashboard"))
+
+    snap_raw = (request.form.get("snapshot_date") or "").strip()
+    try:
+        date = dt.date.fromisoformat(snap_raw) if snap_raw else dt.date.today()
+    except ValueError:
+        flash("날짜 형식이 올바르지 않습니다(YYYY-MM-DD).", "danger")
+        return redirect(request.referrer or url_for("dashboard"))
+
+    ref = request.referrer or url_for("dashboard")
+    try:
+        conn = get_conn()
+        sales_df = fetch_gsheet_as_dataframe(url, sheet_name=sheet)
+        print(f"[INFO] DB 최신화(구글시트): {len(sales_df)}행")
+
+        result = normalize_excel(sales_df, snapshot_date=date, return_failed=True)
+        if isinstance(result, tuple):
+            sales_snap, failed_df = result
+            if not failed_df.empty:
+                failed_csv_path = f"failed_upload_{date.isoformat()}.csv"
+                failed_df.to_csv(failed_csv_path, index=False, encoding="utf-8-sig")
+                session["failed_csv_path"] = failed_csv_path
+                session["failed_count"] = len(failed_df)
+            else:
+                session.pop("failed_csv_path", None)
+                session.pop("failed_count", None)
+        else:
+            sales_snap = result
+            session.pop("failed_csv_path", None)
+            session.pop("failed_count", None)
+
+        sales_count = upsert_snapshot(conn, sales_snap)
+        flash(
+            f"✅ DB 최신화 완료: 구글 시트 → {sales_count}개 품목 반영 (기준일 {date})",
+            "success",
+        )
+        if session.get("failed_count"):
+            flash(
+                f"⚠️ {session['failed_count']}개 행은 반영되지 않았습니다. 실패 목록을 다운로드하세요.",
+                "warning",
+            )
+    except Exception as e:
+        flash(f"DB 최신화 실패: {e}", "danger")
+        import traceback
+        traceback.print_exc()
+
+    return redirect(ref)
+
+
 @app.get("/upload")
 @login_required
 def upload_get():
     """업로드 페이지"""
+    gsheet_settings = _get_gsheet_settings()
     return render_template(
-        "upload.html", 
-        title=APP_TITLE, 
-        default_date=dt.date.today().isoformat()
+        "upload.html",
+        title=APP_TITLE,
+        default_date=dt.date.today().isoformat(),
+        gsheet_settings=gsheet_settings,
     )
 
 
@@ -332,6 +536,7 @@ def upload_get():
 @login_required
 def upload_post():
     """파일 업로드 처리"""
+    sales_source = (request.form.get("sales_source") or "file").strip()  # "file" | "gsheet"
     sales_file = request.files.get("sales_file")
     warehouse_file = request.files.get("warehouse_file")
     warehouse_file2 = request.files.get("warehouse_file2")
@@ -344,38 +549,61 @@ def upload_post():
     channel_sheet = (request.form.get("channel_sheet") or "").strip()
     distribution_sheet = (request.form.get("distribution_sheet") or "").strip()
     omni_sheet = (request.form.get("omni_sheet") or "").strip()
-    
-    # 필수 파일 검증
-    if not sales_file or not sales_file.filename:
-        flash("상품분석판매 파일을 선택하세요.", "danger")
-        return redirect(url_for("upload_get"))
-    
+    # 구글 시트 전용 파라미터
+    gsheet_input = (request.form.get("gsheet_input") or "").strip()
+    gsheet_sheet = (request.form.get("gsheet_sheet") or "재고판매현황").strip()
+
+    # 구글 시트 소스: 입력이 없으면 DB 저장값 자동 사용
+    if sales_source == "gsheet" and not gsheet_input:
+        saved = _get_gsheet_settings()
+        gsheet_input = saved.get("url", "")
+        if not gsheet_sheet or gsheet_sheet == "재고판매현황":
+            gsheet_sheet = saved.get("sheet", "재고판매현황")
+
+    # 필수 소스 검증
+    if sales_source == "gsheet":
+        if not gsheet_input:
+            flash("구글 시트 URL 또는 스프레드시트 ID를 입력하세요. 먼저 설정을 저장해 주세요.", "danger")
+            return redirect(url_for("upload_get"))
+    else:
+        if not sales_file or not sales_file.filename:
+            flash("상품분석판매 파일을 선택하세요.", "danger")
+            return redirect(url_for("upload_get"))
+
     # 날짜 파싱
     try:
         date = dt.date.fromisoformat(snapshot_date) if snapshot_date else dt.date.today()
     except ValueError:
         flash("날짜 형식이 올바르지 않습니다(YYYY-MM-DD).", "danger")
         return redirect(url_for("upload_get"))
-    
+
     try:
         conn = get_conn()
-        
-        # 1. 상품분석판매 업로드
-        sales_filename = sales_file.filename or ""
-        sales_ext = os.path.splitext(sales_filename)[1].lower()
-        
-        if sales_ext == ".csv":
+
+        # 1. 상품분석판매 로드 (파일 업로드 또는 구글 시트)
+        if sales_source == "gsheet":
             try:
-                sales_df = pd.read_csv(sales_file)
-            except UnicodeDecodeError:
-                sales_file.seek(0)
-                sales_df = pd.read_csv(sales_file, encoding="cp949")
-        elif sales_ext in [".xlsx", ".xls", ".xlsb"]:
-            sales_df = pd.read_excel(sales_file, sheet_name=0)
+                sales_df = fetch_gsheet_as_dataframe(gsheet_input, sheet_name=gsheet_sheet)
+                print(f"[INFO] 구글 시트 로드 완료: {len(sales_df)}행, 컬럼: {sales_df.columns.tolist()}")
+            except Exception as gs_err:
+                flash(f"구글 시트 읽기 실패: {gs_err}", "danger")
+                return redirect(url_for("upload_get"))
         else:
-            flash("지원하지 않는 파일 형식입니다. CSV 또는 Excel 파일을 사용하세요.", "danger")
-            return redirect(url_for("upload_get"))
-        
+            sales_filename = sales_file.filename or ""
+            sales_ext = os.path.splitext(sales_filename)[1].lower()
+
+            if sales_ext == ".csv":
+                try:
+                    sales_df = pd.read_csv(sales_file)
+                except UnicodeDecodeError:
+                    sales_file.seek(0)
+                    sales_df = pd.read_csv(sales_file, encoding="cp949")
+            elif sales_ext in [".xlsx", ".xls", ".xlsb"]:
+                sales_df = pd.read_excel(sales_file, sheet_name=0)
+            else:
+                flash("지원하지 않는 파일 형식입니다. CSV 또는 Excel 파일을 사용하세요.", "danger")
+                return redirect(url_for("upload_get"))
+
         # return_failed=True로 호출하여 실패한 행도 받기
         result = normalize_excel(sales_df, snapshot_date=date, return_failed=True)
         if isinstance(result, tuple):
@@ -749,14 +977,43 @@ def _item_code_from_sku(sku) -> str:
     return s[2:4].upper()
 
 
+def _season_code_sort_key_item(c: str) -> tuple:
+    s = str(c).upper().strip()
+    if len(s) < 2:
+        return (2, s)
+    rest = s[1:]
+    if rest.isdigit():
+        return (0, int(rest))
+    return (1, rest)
+
+
+def _df_filter_item_tab(
+    df: pd.DataFrame, current_season_letter: str, item_tab: str
+) -> pd.DataFrame:
+    """올해 시즌(G*) 행만, item_tab이 all이 아니면 해당 시즌코드만."""
+    if df.empty or "sku" not in df.columns:
+        return df.iloc[0:0].copy()
+    sc = df["sku"].astype(str).str[4:6].str.strip().str.upper()
+    mask = sc.str.startswith(current_season_letter) & (sc.str.len() >= 2)
+    tab = (item_tab or "all").strip().upper()
+    if tab and tab != "ALL":
+        mask = mask & (sc == tab)
+    return df.loc[mask].copy()
+
+
 def _build_item_inventory_summary(
     conn,
     latest_date: str,
     latest_df: pd.DataFrame,
-    selected_season_codes: list[str],
+    current_season_letter: str,
+    item_tab: str,
+    allowed_season_tabs: list[str],
 ) -> tuple[list[dict], Optional[str], bool]:
     """
     최신 스냅샷 기준 아이템별 총재고·총판매량·판매량 비중, 직전 스냅샷 대비 재고 증감.
+    테이블 집계: 올해 시즌 + (탭: 전체 또는 G1/G2/…).
+    상세(offcanvas): 올해 시즌만, 시즌별 행은 G1~GA 전부.
+    정렬: 총 판매량 내림차순.
     Returns: (rows, prev_date or None, has_prev)
     """
     dates_df = pd.read_sql_query(
@@ -775,10 +1032,9 @@ def _build_item_inventory_summary(
         prev_date = str(dates_df.iloc[1]["d"])
     has_prev = prev_date is not None
 
-    season_focus = [str(s).strip().upper() for s in (selected_season_codes or []) if str(s).strip()]
-    season_focus = [s for s in season_focus if s in ("G1", "G2")]
-    if not season_focus:
-        season_focus = ["G1", "G2"]
+    tab_u = (item_tab or "all").strip().upper()
+    if tab_u != "ALL" and tab_u not in {s.upper() for s in (allowed_season_tabs or [])}:
+        tab_u = "ALL"
 
     def prep_work(df: pd.DataFrame) -> pd.DataFrame:
         work = df.copy()
@@ -819,7 +1075,8 @@ def _build_item_inventory_summary(
         )
         return g
 
-    cur_agg = agg_items(latest_df)
+    latest_for_table = _df_filter_item_tab(latest_df, current_season_letter, tab_u)
+    cur_agg = agg_items(latest_for_table)
     if cur_agg.empty:
         return [], prev_date, has_prev
 
@@ -830,11 +1087,12 @@ def _build_item_inventory_summary(
 
     if has_prev and prev_date:
         prev_df = pd.read_sql_query(
-            "SELECT sku, stock, sales_qty FROM snapshots WHERE snapshot_date = ?",
+            "SELECT sku, stock, sales_qty, name FROM snapshots WHERE snapshot_date = ?",
             conn,
             params=(prev_date,),
         )
-        prev_agg = agg_items(prev_df).rename(
+        prev_for_table = _df_filter_item_tab(prev_df, current_season_letter, tab_u)
+        prev_agg = agg_items(prev_for_table).rename(
             columns={"total_stock": "stock_prev", "total_sales": "sales_prev"}
         )
         merged = cur_agg.merge(prev_agg[["item_code", "stock_prev"]], on="item_code", how="left")
@@ -846,41 +1104,39 @@ def _build_item_inventory_summary(
         merged["stock_prev"] = pd.NA
         merged["stock_delta"] = pd.NA
 
-    if has_prev:
-        merged["_abs_delta"] = merged["stock_delta"].abs()
-        merged = merged.sort_values(["_abs_delta", "total_stock"], ascending=[False, False])
-        merged = merged.drop(columns=["_abs_delta"])
-    else:
-        merged = merged.sort_values("total_stock", ascending=False)
+    merged = merged.sort_values("total_sales", ascending=False)
 
-    # 아이템별 시즌 결품률(top4): 시즌 필터의 G1/G2 대상만 집계
+    # 상세용: 올해 시즌 문자로 시작하는 행만 (탭과 무관)
     latest_work = prep_work(latest_df)
+    scy = latest_work["season_code"].astype(str).str.strip().str.upper()
+    mask_y = scy.str.startswith(current_season_letter) & (scy.str.len() >= 2)
+    latest_work_year = latest_work[mask_y].copy()
+
     season_top_map: dict[str, list[dict]] = {}
     item_oos_top20_map: dict[str, list[dict]] = {}
     item_imminent_top20_map: dict[str, list[dict]] = {}
-    if not latest_work.empty:
-        season_work = latest_work[latest_work["season_code"].isin(season_focus)].copy()
-        if not season_work.empty:
-            season_stat = (
-                season_work.groupby(["item_code", "season_code"], as_index=False)
-                .agg(total=("sku", "nunique"), stockout=("is_oos", "sum"))
-            )
-            season_stat["rate"] = (season_stat["stockout"] / season_stat["total"] * 100.0).fillna(0).round(1)
-            season_stat = season_stat.sort_values(["item_code", "rate", "stockout", "total"], ascending=[True, False, False, False])
-            for item_code, grp in season_stat.groupby("item_code"):
-                top = grp.head(4)
-                season_top_map[str(item_code)] = [
-                    {
-                        "code": str(rr["season_code"]),
-                        "rate": float(rr["rate"]),
-                        "stockout": int(rr["stockout"]),
-                        "total": int(rr["total"]),
-                    }
-                    for _, rr in top.iterrows()
-                ]
+    if not latest_work_year.empty:
+        season_stat = (
+            latest_work_year.groupby(["item_code", "season_code"], as_index=False)
+            .agg(total=("sku", "nunique"), stockout=("is_oos", "sum"))
+        )
+        season_stat["rate"] = (season_stat["stockout"] / season_stat["total"] * 100.0).fillna(0).round(1)
+        for item_code, grp in season_stat.groupby("item_code"):
+            grp_sorted = grp.copy()
+            grp_sorted["_sk"] = grp_sorted["season_code"].astype(str).map(_season_code_sort_key_item)
+            grp_sorted = grp_sorted.sort_values("_sk").drop(columns=["_sk"])
+            season_top_map[str(item_code)] = [
+                {
+                    "code": str(rr["season_code"]),
+                    "rate": float(rr["rate"]),
+                    "stockout": int(rr["stockout"]),
+                    "total": int(rr["total"]),
+                }
+                for _, rr in grp_sorted.iterrows()
+            ]
 
         # 아이템 기준 결품 SKU Top20: 재고<=0, 판매량 높은 순
-        oos_candidates = latest_work[latest_work["is_oos"] == 1].copy()
+        oos_candidates = latest_work_year[latest_work_year["is_oos"] == 1].copy()
         if not oos_candidates.empty:
             oos_candidates = oos_candidates.sort_values(
                 ["item_code", "sales_qty", "sku"], ascending=[True, False, True]
@@ -899,7 +1155,9 @@ def _build_item_inventory_summary(
                 ]
 
         # 결품임박 Top20: 재고>0 이고 판매량>0, (재고÷일판매) 낮은 순 = 빨리 소진
-        im = latest_work[(latest_work["stock"] > 0) & (latest_work["sales_qty"] > 0)].copy()
+        im = latest_work_year[
+            (latest_work_year["stock"] > 0) & (latest_work_year["sales_qty"] > 0)
+        ].copy()
         if not im.empty:
             daily = im["sales_qty"].astype(float) / 7.0
             im = im.assign(_daily=daily)
@@ -983,6 +1241,11 @@ def _dashboard_impl():
     
     # 시즌 코드 추출 (SKU 5,6번째 자리 = 인덱스 4:6)
     all_data["season_code"] = all_data["sku"].astype(str).str[4:6]
+
+    # 올해 시즌 문자 (A=2020 … G=2026 …) — KPI·복종별 탭에서 공통 사용
+    _current_year = dt.date.today().year
+    current_season_letter = chr(ord("A") + (_current_year - 2020))
+    prev_season_letter = chr(ord("A") + (_current_year - 2021))
     
     # 복종 코드 추출 (SKU 8번째 자리 = 인덱스 7)
     all_data["category_code"] = all_data["sku"].astype(str).str[7]
@@ -1035,8 +1298,17 @@ def _dashboard_impl():
     total_channel_stock_all = int(all_data["channel_stock"].sum())
     has_warehouse_all = int((all_data["warehouse_stock"] > 0).sum())
     total_warehouse_stock_all = int(all_data["warehouse_stock"].sum())
-    stockout_count_all = int((all_data["stock"] == 0).sum())
-    stockout_rate_all = round((stockout_count_all / total_items_all * 100), 1) if total_items_all > 0 else 0.0
+    # 상단 KPI 결품률: 올해 시즌(현재 연도 문자로 시작하는 시즌코드) SKU만 집계
+    _sc_norm = all_data["season_code"].astype(str).str.strip().str.upper()
+    _mask_curr_year = _sc_norm.str.startswith(current_season_letter) & (_sc_norm.str.len() >= 2)
+    _df_curr_year = all_data[_mask_curr_year]
+    total_items_curr_year = int(_df_curr_year["sku"].nunique()) if len(_df_curr_year) > 0 else 0
+    stockout_count_curr_year = int((_df_curr_year["stock"] == 0).sum()) if len(_df_curr_year) > 0 else 0
+    stockout_rate_curr_year = (
+        round((stockout_count_curr_year / total_items_curr_year * 100), 1)
+        if total_items_curr_year > 0
+        else 0.0
+    )
     
     # 분배내역 KPI (품목수: 분배내역 있는 행 수, 전체수량: 분배내역 값 중 숫자 합계)
     dist_note_filled = all_data["distribution_note"].fillna("").astype(str).str.strip() != ""
@@ -1047,20 +1319,44 @@ def _dashboard_impl():
         if pd.notna(n):
             distribution_total_qty_all += int(n)
     
-    # 복종별 결품률 계산
-    category_stockout_stats = []
-    for cat_code in sorted(all_data["category_code"].dropna().unique()):
-        cat_data = all_data[all_data["category_code"] == cat_code]
-        cat_total = len(cat_data)
-        cat_stockout = int((cat_data["stock"] == 0).sum())
-        cat_rate = round((cat_stockout / cat_total * 100), 1) if cat_total > 0 else 0.0
-        category_stockout_stats.append({
-            "code": cat_code,
-            "total": cat_total,
-            "stockout": cat_stockout,
-            "rate": cat_rate
-        })
-    
+    def _calc_category_stats(data: pd.DataFrame) -> list:
+        result = []
+        for cat_code in sorted(data["category_code"].dropna().unique()):
+            cat_data = data[data["category_code"] == cat_code]
+            cat_total = len(cat_data)
+            cat_stockout = int((cat_data["stock"] == 0).sum())
+            cat_rate = round((cat_stockout / cat_total * 100), 1) if cat_total > 0 else 0.0
+            result.append({"code": cat_code, "total": cat_total, "stockout": cat_stockout, "rate": cat_rate})
+        return result
+
+    def _season_code_sort_key(c: str) -> tuple:
+        s = str(c).upper().strip()
+        if len(s) < 2:
+            return (2, s)
+        rest = s[1:]
+        if rest.isdigit():
+            return (0, int(rest))
+        return (1, rest)
+
+    # 복종별 결품률: 올해 시즌 문자로 시작하는 시즌코드만 — 전체(올해 합) + G1, G2, … 각각
+    _curr_mask = _sc_norm.str.startswith(current_season_letter) & (_sc_norm.str.len() >= 2)
+    all_curr_season = all_data[_curr_mask]
+    curr_year_codes = sorted(
+        {
+            str(x).strip().upper()
+            for x in all_curr_season["season_code"].dropna().unique()
+            if str(x).strip() and len(str(x).strip()) >= 2
+        },
+        key=_season_code_sort_key,
+    )
+    category_stockout_by_season: dict[str, list] = {
+        "all": _calc_category_stats(all_curr_season),
+    }
+    for code in curr_year_codes:
+        category_stockout_by_season[code] = _calc_category_stats(
+            all_data[_sc_norm == code]
+        )
+
     # 시즌별 결품률 계산 (2자리 코드 F1, G1 등 + 첫글자 그룹)
     season_stockout_stats = []
     for sc in sorted(all_data["season_code"].dropna().unique()):
@@ -1078,11 +1374,11 @@ def _dashboard_impl():
             "rate": sc_rate,
             "letter": sc_str[0].upper(),
         })
-    
+
     season_groups = defaultdict(list)
     for s in season_stockout_stats:
         season_groups[s["letter"]].append(s)
-    
+
     season_group_stats = []
     for letter in sorted(season_groups.keys()):
         seasons = season_groups[letter]
@@ -1095,6 +1391,8 @@ def _dashboard_impl():
             "stockout": group_stockout,
             "rate": group_rate,
             "seasons": sorted(seasons, key=lambda x: x["code"]),
+            "is_current": letter == current_season_letter,
+            "is_prev":    letter == prev_season_letter,
         })
     
     # 전체 데이터 기준 긴급주의 써머리 (상위 30개, 복종별 필터 적용)
@@ -1267,9 +1565,18 @@ def _dashboard_impl():
         .to_dict(orient="records")
     )
     
-    # 아이템별 재고 현황 (스냅샷 2일 이상이면 직전 일자 대비 증감 표시)
+    # 아이템별 재고 현황 (올해 시즌 + item_tab, 판매량순 / 상세는 올해 G* 전체)
+    item_tab_req = (request.args.get("item_tab") or "all").strip().upper()
+    if item_tab_req != "ALL" and item_tab_req not in {str(c).upper() for c in curr_year_codes}:
+        item_tab_req = "ALL"
+    item_tab_selected = item_tab_req.lower()
     item_summary, item_prev_date, item_has_prev = _build_item_inventory_summary(
-        conn, str(latest_date), latest, season_codes_selected
+        conn,
+        str(latest_date),
+        latest,
+        current_season_letter,
+        item_tab_req,
+        curr_year_codes,
     )
 
     # SKU 히스토리 차트
@@ -1303,8 +1610,9 @@ def _dashboard_impl():
         "total_channel_stock": total_channel_stock_all,
         "has_warehouse": has_warehouse_all,
         "total_warehouse_stock": total_warehouse_stock_all,
-        "stockout_count": stockout_count_all,
-        "stockout_rate": stockout_rate_all,
+        "stockout_count": stockout_count_curr_year,
+        "stockout_rate": stockout_rate_curr_year,
+        "stockout_denominator": total_items_curr_year,
         "distribution_items": distribution_items_all,
         "distribution_total_qty": distribution_total_qty_all,
     }
@@ -1324,7 +1632,10 @@ def _dashboard_impl():
         latest_date=latest_date,
         kpi=kpi_all,  # 전체 KPI (상단)
         kpi_filtered=kpi_filtered,  # 필터링된 KPI (필터 하단)
-        category_stockout_stats=category_stockout_stats,  # 복종별 결품률
+        category_stockout_by_season=category_stockout_by_season,
+        curr_year_season_codes=curr_year_codes,
+        current_season_letter=current_season_letter,
+        prev_season_letter=prev_season_letter,
         season_group_stats=season_group_stats,  # 시즌별 결품률 (첫글자 그룹 + 2자리 시즌)
         categories=categories,
         season_codes=season_codes,  # 시즌 코드 목록
@@ -1341,6 +1652,7 @@ def _dashboard_impl():
             "urgent_category": urgent_category,  # 긴급주의 복종 필터
             "target_cover_days": target_cover_days,
             "sku": sku_pick,
+            "item_tab": item_tab_selected,
         },
         high_risk_summary=high_risk_summary,
         table=table,
@@ -1353,6 +1665,7 @@ def _dashboard_impl():
         item_summary=item_summary,
         item_prev_date=item_prev_date,
         item_has_prev=item_has_prev,
+        item_tab_season_codes=curr_year_codes,
     )
 
 
@@ -1420,7 +1733,7 @@ if __name__ == "__main__":
         pass
     else:
         print("=" * 70)
-        print("재고 대시보드 V3 서버 시작!")
+        print("재고 대시보드 V4 서버 시작!")
         print("=" * 70)
         print("접속 주소: http://127.0.0.1:5003")
         print("기본 비밀번호: 1234")

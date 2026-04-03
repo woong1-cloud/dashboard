@@ -7,3 +7,6 @@ gunicorn
 streamlit>=1.23.0
 # Altair 5+는 vegalite.v4 경로 제거로 Streamlit 구버전과 충돌 → 4.x 고정
 altair<5
+# 구글 시트 API 연동 (비공개 시트 접근 시 필요; 공개 시트는 없어도 됨)
+gspread
+google-auth

@@ -1,6 +1,6 @@
 # Flask 대시보드(dashboard_v2.py) 배포 가이드 — UI 수정 없이
 
-**배포 표기 버전: V3** (`APP_TITLE`). Gunicorn 진입점은 **`dashboard_v2:app`**(파일명 `dashboard_v2.py`) 그대로 두면 됩니다.
+**배포 표기 버전: V4** (`APP_TITLE`). Gunicorn 진입점은 **`dashboard_v2:app`**(파일명 `dashboard_v2.py`) 그대로 두면 됩니다.
 
 이 문서는 **Flask 버전(dashboard_v2.py)** 을 **UI 변경 없이** 그대로 배포하는 단계별 가이드입니다.  
 **Railway** 기준으로 작성했으며, 무료/유료 여부도 정리했습니다.
