@@ -103,6 +103,280 @@ def _run_upload_background(tasks: list[dict[str, Any]], cache_obj: Cache) -> Non
             conn.close()
 
 
+def _process_upload_background(files_data: dict[str, Any], date_str: str, cache_obj: Cache) -> None:
+    """백그라운드에서 파일 파싱 + DB 저장 전체 처리."""
+    import io
+
+    conn = None
+    try:
+        conn = get_conn()
+        date = dt.date.fromisoformat(date_str)
+
+        def _cell_int(val: Any, default: int = 0) -> int:
+            try:
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return default
+                return int(float(val))
+            except (TypeError, ValueError):
+                return default
+
+        # 1) 상품분석판매
+        sales = files_data.get("sales")
+        if sales:
+            bio = io.BytesIO(sales["data"])
+            ext = os.path.splitext(sales["name"])[1].lower()
+            if ext == ".csv":
+                try:
+                    sales_df = pd.read_csv(bio)
+                except UnicodeDecodeError:
+                    bio.seek(0)
+                    sales_df = pd.read_csv(bio, encoding="cp949")
+            elif ext in [".xlsx", ".xls", ".xlsb"]:
+                sales_df = pd.read_excel(bio, sheet_name=0)
+            else:
+                raise ValueError("지원하지 않는 상품분석판매 파일 형식입니다.")
+
+            result = normalize_excel(sales_df, snapshot_date=date, return_failed=True)
+            sales_snap = result[0] if isinstance(result, tuple) else result
+            upsert_snapshot(conn, sales_snap)
+            conn.commit()
+            print(f"[INFO] 백그라운드 상품분석판매 완료: {len(sales_snap)}행")
+
+        # 2) 항만 물류
+        wh1 = files_data.get("warehouse1")
+        if wh1:
+            bio = io.BytesIO(wh1["data"])
+            warehouse_df = pd.read_excel(bio, sheet_name=wh1.get("sheet", 0))
+            warehouse_df.columns = [str(c).strip() for c in warehouse_df.columns]
+
+            sku_map: dict[str, int] = {}
+            solid_map: dict[str, int] = {}
+            assort_map: dict[str, int] = {}
+            ratio_map: dict[str, int] = {}
+            box_map: dict[str, int] = {}
+
+            for _, row in warehouse_df.iterrows():
+                sku = str(row.get("상품", "") or "").strip()
+                if not sku or len(sku) != 15:
+                    continue
+                solid = _cell_int(row.get("솔리드가용재고", 0))
+                assort = _cell_int(row.get("아소트 가용재고", row.get("아소트가용재고", 0)))
+                ratio = _cell_int(row.get("아소트비율", 0))
+                box_count = _cell_int(row.get("아소트박스수", 0))
+                sku_map[sku] = solid + assort
+                solid_map[sku] = solid
+                assort_map[sku] = assort
+                if ratio > 0:
+                    ratio_map[sku] = ratio
+                if box_count > 0:
+                    box_map[sku] = box_count
+
+            if sku_map:
+                update_warehouse_stock(
+                    conn,
+                    date_str,
+                    sku_map,
+                    warehouse_num=1,
+                    solid_map=solid_map,
+                    assort_map=assort_map,
+                    assort_ratio_map=ratio_map if ratio_map else None,
+                    assort_box_map=box_map if box_map else None,
+                )
+                conn.commit()
+                print(f"[INFO] 백그라운드 항만 완료: {len(sku_map)}개 SKU")
+
+        # 3) 부평 물류
+        wh2 = files_data.get("warehouse2")
+        if wh2:
+            bio = io.BytesIO(wh2["data"])
+            warehouse2_df = pd.read_excel(bio, sheet_name=wh2.get("sheet", 0))
+            warehouse2_df.columns = [str(c).strip() for c in warehouse2_df.columns]
+
+            sku_map: dict[str, int] = {}
+            solid_map: dict[str, int] = {}
+            assort_map: dict[str, int] = {}
+            ratio_map: dict[str, int] = {}
+            box_map: dict[str, int] = {}
+
+            for _, row in warehouse2_df.iterrows():
+                sku = str(row.get("상품", "") or "").strip()
+                if not sku or len(sku) != 15:
+                    continue
+                solid = _cell_int(row.get("솔리드가용재고", 0))
+                assort = _cell_int(row.get("아소트 가용재고", row.get("아소트가용재고", 0)))
+                ratio = _cell_int(row.get("아소트비율", 0))
+                box_count = _cell_int(row.get("아소트박스수", 0))
+                sku_map[sku] = solid + assort
+                solid_map[sku] = solid
+                assort_map[sku] = assort
+                if ratio > 0:
+                    ratio_map[sku] = ratio
+                if box_count > 0:
+                    box_map[sku] = box_count
+
+            if sku_map:
+                update_warehouse_stock(
+                    conn,
+                    date_str,
+                    sku_map,
+                    warehouse_num=2,
+                    solid_map=solid_map,
+                    assort_map=assort_map,
+                    assort_ratio_map=ratio_map if ratio_map else None,
+                    assort_box_map=box_map if box_map else None,
+                )
+                conn.commit()
+                print(f"[INFO] 백그라운드 부평 완료: {len(sku_map)}개 SKU")
+
+        # 4) 매장재고
+        ch = files_data.get("channel")
+        if ch:
+            bio = io.BytesIO(ch["data"])
+            channel_df = pd.read_excel(bio, sheet_name=ch.get("sheet", 0))
+            channel_snap = normalize_excel(channel_df, snapshot_date=date)
+            sku_map: dict[str, int] = {}
+            for _, row in channel_snap.iterrows():
+                sku = str(row.get("sku", "")).strip()
+                if sku and len(sku) == 15:
+                    sku_map[sku] = _cell_int(row.get("channel_stock"), 0)
+            if sku_map:
+                update_channel_stock(conn, date_str, sku_map)
+                conn.commit()
+                print(f"[INFO] 백그라운드 매장재고 완료: {len(sku_map)}개 SKU")
+
+        # 5) 분배내역
+        dist = files_data.get("distribution")
+        if dist:
+            bio = io.BytesIO(dist["data"])
+            dist_df = pd.read_excel(bio, sheet_name=dist.get("sheet", 0))
+            dist_df.columns = [str(c).strip() for c in dist_df.columns]
+
+            sku_col = None
+            for col in ["SKU", "상품코드", "상품", "품목코드", "sku"]:
+                if col in dist_df.columns:
+                    sku_col = col
+                    break
+            qty_col = None
+            for col in ["분배량", "수량", "분배수량"]:
+                if col in dist_df.columns:
+                    qty_col = col
+                    break
+            if not qty_col and len(dist_df.columns) >= 14:
+                qty_col = dist_df.columns[13]
+            note_col = None
+            for col in ["분배내역", "비고", "메모", "내역", "분배요청내역", "분배요청", "비고사항"]:
+                if col in dist_df.columns:
+                    note_col = col
+                    break
+
+            use_qty = qty_col is not None
+            use_note = note_col is not None and not use_qty
+            if sku_col and (use_qty or use_note):
+                sku_map: dict[str, str] = {}
+                for _, row in dist_df.iterrows():
+                    sku_raw = str(row.get(sku_col, "") or "").strip()
+                    sku = sku_raw[:15] if len(sku_raw) >= 15 else sku_raw
+                    if not sku or sku == "nan":
+                        continue
+                    if use_qty:
+                        qty = _cell_int(row.get(qty_col), 0)
+                        sku_map[sku] = str(_cell_int(sku_map.get(sku), 0) + qty)
+                    else:
+                        note = "" if pd.isna(row.get(note_col)) else str(row.get(note_col)).strip()
+                        if not note:
+                            continue
+                        if sku in sku_map:
+                            sku_map[sku] = f"{sku_map[sku]} / {note}"
+                        else:
+                            sku_map[sku] = note
+
+                if sku_map:
+                    update_distribution_note(conn, date_str, sku_map)
+                    conn.commit()
+                    print(f"[INFO] 백그라운드 분배내역 완료: {len(sku_map)}개 SKU")
+
+        # 6) 옴니판매불가
+        omni = files_data.get("omni")
+        if omni:
+            bio = io.BytesIO(omni["data"])
+            ext = os.path.splitext(omni["name"])[1].lower()
+            read_kwargs: dict[str, Any] = {"sheet_name": omni.get("sheet", 0)}
+            if ext == ".xls":
+                try:
+                    import xlrd  # noqa: F401
+                    read_kwargs["engine"] = "xlrd"
+                except ImportError:
+                    raise ImportError(
+                        "옴니판매불가 .xls 파일을 읽으려면 xlrd 패키지가 필요합니다."
+                    )
+            omni_df = pd.read_excel(bio, **read_kwargs)
+            if omni_df.shape[1] >= 8:
+                df = omni_df.copy()
+                store_col = df.columns[2]
+                style_col = df.columns[3]
+                sku_col = df.columns[4]
+                blocked_col = df.columns[7]
+
+                df["store_name"] = df[store_col].astype(str).str.strip()
+                df["style_code"] = df[style_col].astype(str).str.strip()
+                df["sku_code"] = df[sku_col].astype(str).str.strip()
+                df["blocked_qty"] = pd.to_numeric(df[blocked_col], errors="coerce").fillna(0).astype(int)
+                df = df[
+                    (df["style_code"] != "") & (df["sku_code"] != "") & (df["blocked_qty"] > 0)
+                ].copy()
+
+                if not df.empty:
+                    summary = df.groupby(["style_code", "sku_code"], as_index=False)["blocked_qty"].sum()
+                    store_agg = (
+                        df.groupby(["style_code", "sku_code", "store_name"], as_index=False)["blocked_qty"]
+                        .sum()
+                        .sort_values(["style_code", "sku_code", "blocked_qty"], ascending=[True, True, False])
+                    )
+                    top_store_df = store_agg.drop_duplicates(
+                        subset=["style_code", "sku_code"], keep="first"
+                    ).rename(columns={"store_name": "top_store"})
+                    omni_join = summary.merge(
+                        top_store_df[["style_code", "sku_code", "top_store"]],
+                        on=["style_code", "sku_code"],
+                        how="left",
+                    )
+
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM omni_blocked WHERE snapshot_date = %s",
+                            (date_str,),
+                        )
+                        rows = [
+                            (
+                                date_str,
+                                str(r["style_code"]),
+                                str(r["sku_code"]),
+                                int(r["blocked_qty"]),
+                                str(r.get("top_store") or ""),
+                            )
+                            for _, r in omni_join.iterrows()
+                        ]
+                        cur.executemany(
+                            """
+                            INSERT INTO omni_blocked (
+                                snapshot_date, style_code, sku_code, blocked_qty, top_store
+                            ) VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            rows,
+                        )
+                    conn.commit()
+                    print(f"[INFO] 백그라운드 옴니판매불가 완료: {len(rows)}개 단품")
+
+        cache_obj.clear()
+        print("[INFO] 백그라운드 전체 업로드 완료")
+    except Exception as e:
+        print(f"[ERROR] 백그라운드 업로드 실패: {e}")
+        traceback.print_exc()
+    finally:
+        if conn:
+            conn.close()
+
+
 def _invalidate_snapshot_caches() -> None:
     """스냅샷 데이터 변경 후 dashboard_base·item_summary_*·대시보드 뷰 캐시 무효화."""
     cache.delete("dashboard_base")
@@ -1157,8 +1431,8 @@ def upload_get():
 @app.post("/upload")
 @login_required
 def upload_post():
-    """파일 업로드 처리"""
-    sales_source = (request.form.get("sales_source") or "file").strip()  # "file" | "gsheet"
+    """파일 바이트를 먼저 수집하고 백그라운드에서 처리."""
+    sales_source = (request.form.get("sales_source") or "file").strip()
     sales_file = request.files.get("sales_file")
     warehouse_file = request.files.get("warehouse_file")
     warehouse_file2 = request.files.get("warehouse_file2")
@@ -1171,565 +1445,83 @@ def upload_post():
     channel_sheet = (request.form.get("channel_sheet") or "").strip()
     distribution_sheet = (request.form.get("distribution_sheet") or "").strip()
     omni_sheet = (request.form.get("omni_sheet") or "").strip()
-    # 구글 시트 전용 파라미터
     gsheet_input = (request.form.get("gsheet_input") or "").strip()
     gsheet_sheet = (request.form.get("gsheet_sheet") or "재고판매현황").strip()
 
-    # 구글 시트 소스: 입력이 없으면 DB 저장값 자동 사용
-    if sales_source == "gsheet" and not gsheet_input:
-        saved = _get_gsheet_settings()
-        gsheet_input = saved.get("url", "")
-        if not gsheet_sheet or gsheet_sheet == "재고판매현황":
-            gsheet_sheet = saved.get("sheet", "재고판매현황")
-
-    has_sales_file = sales_source == "gsheet" or (sales_file and sales_file.filename)
-    has_warehouse = (warehouse_file and warehouse_file.filename) or (
-        warehouse_file2 and warehouse_file2.filename
-    )
-    has_channel = channel_file and channel_file.filename
-    has_distribution = distribution_file and distribution_file.filename
-    has_omni = omni_file and omni_file.filename
-
-    if (
-        not has_sales_file
-        and not has_warehouse
-        and not has_channel
-        and not has_distribution
-        and not has_omni
-    ):
-        flash("최소 하나 이상의 파일을 선택하세요.", "danger")
-        return redirect(url_for("upload_get"))
-
-    # 날짜 파싱
     try:
         date = dt.date.fromisoformat(snapshot_date) if snapshot_date else dt.date.today()
     except ValueError:
         flash("날짜 형식이 올바르지 않습니다(YYYY-MM-DD).", "danger")
         return redirect(url_for("upload_get"))
 
-    conn = None
-    upload_success = False
-    cache_cleared_in_background = False
-    try:
-        conn = get_conn()
-        tasks: list[dict[str, Any]] = []
+    files_data: dict[str, Any] = {}
 
-        # 1. 상품분석판매 로드 (파일 업로드 또는 구글 시트)
-        sales_count = 0
-        if has_sales_file:
-            if sales_source == "gsheet":
-                if not gsheet_input:
-                    flash("구글 시트 URL을 확인할 수 없습니다. 업로드 페이지에서 주소를 저장하거나 다시 시도해 주세요.", "danger")
-                    return redirect(url_for("upload_get"))
-                try:
-                    sales_df = fetch_gsheet_as_dataframe(gsheet_input, sheet_name=gsheet_sheet)
-                    print(f"[INFO] 구글 시트 로드 완료: {len(sales_df)}행, 컬럼: {sales_df.columns.tolist()}")
-                except Exception as gs_err:
-                    flash(f"구글 시트 읽기 실패: {gs_err}", "danger")
-                    return redirect(url_for("upload_get"))
-            else:
-                sales_filename = sales_file.filename or ""
-                sales_ext = os.path.splitext(sales_filename)[1].lower()
+    if sales_source == "gsheet":
+        if not gsheet_input:
+            saved = _get_gsheet_settings()
+            gsheet_input = saved.get("url", "")
+            if not gsheet_sheet or gsheet_sheet == "재고판매현황":
+                gsheet_sheet = saved.get("sheet", "재고판매현황")
+        if gsheet_input:
+            try:
+                sales_df = fetch_gsheet_as_dataframe(gsheet_input, sheet_name=gsheet_sheet)
+                files_data["sales"] = {
+                    "name": "gsheet.csv",
+                    "data": sales_df.to_csv(index=False).encode("utf-8-sig"),
+                }
+            except Exception as e:
+                flash(f"구글 시트 읽기 실패: {e}", "danger")
+                return redirect(url_for("upload_get"))
+    elif sales_file and sales_file.filename:
+        files_data["sales"] = {
+            "name": sales_file.filename,
+            "data": sales_file.read(),
+        }
 
-                if sales_ext == ".csv":
-                    try:
-                        sales_df = pd.read_csv(sales_file)
-                    except UnicodeDecodeError:
-                        sales_file.seek(0)
-                        sales_df = pd.read_csv(sales_file, encoding="cp949")
-                elif sales_ext in [".xlsx", ".xls", ".xlsb"]:
-                    sales_df = pd.read_excel(sales_file, sheet_name=0)
-                else:
-                    flash("지원하지 않는 파일 형식입니다. CSV 또는 Excel 파일을 사용하세요.", "danger")
-                    return redirect(url_for("upload_get"))
+    if warehouse_file and warehouse_file.filename:
+        files_data["warehouse1"] = {
+            "name": warehouse_file.filename,
+            "data": warehouse_file.read(),
+            "sheet": warehouse_sheet or 0,
+        }
+    if warehouse_file2 and warehouse_file2.filename:
+        files_data["warehouse2"] = {
+            "name": warehouse_file2.filename,
+            "data": warehouse_file2.read(),
+            "sheet": warehouse2_sheet or 0,
+        }
+    if channel_file and channel_file.filename:
+        files_data["channel"] = {
+            "name": channel_file.filename,
+            "data": channel_file.read(),
+            "sheet": channel_sheet or 0,
+        }
+    if distribution_file and distribution_file.filename:
+        files_data["distribution"] = {
+            "name": distribution_file.filename,
+            "data": distribution_file.read(),
+            "sheet": distribution_sheet or 0,
+        }
+    if omni_file and omni_file.filename:
+        files_data["omni"] = {
+            "name": omni_file.filename,
+            "data": omni_file.read(),
+            "sheet": omni_sheet or 0,
+        }
 
-            # return_failed=True로 호출하여 실패한 행도 받기
-            result = normalize_excel(sales_df, snapshot_date=date, return_failed=True)
-            if isinstance(result, tuple):
-                sales_snap, failed_df = result
-                # 실패한 행이 있으면 CSV로 저장
-                if not failed_df.empty:
-                    failed_csv_path = f"failed_upload_{date.isoformat()}.csv"
-                    failed_df.to_csv(failed_csv_path, index=False, encoding='utf-8-sig')
-                    session['failed_csv_path'] = failed_csv_path
-                    session['failed_count'] = len(failed_df)
-            else:
-                sales_snap = result
-
-            if USE_POSTGRES:
-                sales_count = len(sales_snap)
-                tasks.append({"type": "upsert", "df": sales_snap})
-            else:
-                sales_count = upsert_snapshot(conn, sales_snap)
-                conn.commit()
-
-        # 2. 물류센터1(항만) 재고 업로드 (선택사항) — 물류 전용 컬럼 직접 파싱 (normalize_excel 경유 금지)
-        warehouse1_count = 0
-        if warehouse_file and warehouse_file.filename:
-            warehouse_filename = warehouse_file.filename or ""
-            warehouse_ext = os.path.splitext(warehouse_filename)[1].lower()
-
-            if warehouse_ext in [".xlsx", ".xls", ".xlsb"]:
-                warehouse_df = pd.read_excel(
-                    warehouse_file, sheet_name=(warehouse_sheet or 0)
-                )
-                warehouse_df.columns = [str(c).strip() for c in warehouse_df.columns]
-                print(f"[INFO] 항만 엑셀 컬럼: {warehouse_df.columns.tolist()}")
-                print(f"[INFO] 항만 엑셀 행 수: {len(warehouse_df)}")
-
-                def _wh_cell_int(val, default=0) -> int:
-                    try:
-                        if val is None or (isinstance(val, float) and pd.isna(val)):
-                            return default
-                        return int(float(val))
-                    except (TypeError, ValueError):
-                        return default
-
-                sku_warehouse_map = {}
-                sku_solid_map = {}
-                sku_assort_map = {}
-                sku_ratio_map = {}
-                sku_box_map = {}
-
-                for _, row in warehouse_df.iterrows():
-                    sku = str(row.get("상품", "") or "").strip()
-                    if not sku or len(sku) != 15:
-                        continue
-
-                    solid = _wh_cell_int(row.get("솔리드가용재고", 0))
-                    assort = _wh_cell_int(
-                        row.get("아소트 가용재고", row.get("아소트가용재고", 0))
-                    )
-                    ratio = _wh_cell_int(row.get("아소트비율", 0))
-                    box_count = _wh_cell_int(row.get("아소트박스수", 0))
-                    total = solid + assort
-
-                    sku_warehouse_map[sku] = total
-                    sku_solid_map[sku] = solid
-                    sku_assort_map[sku] = assort
-                    if ratio > 0:
-                        sku_ratio_map[sku] = ratio
-                    if box_count > 0:
-                        sku_box_map[sku] = box_count
-
-                if sku_warehouse_map:
-                    if USE_POSTGRES:
-                        warehouse1_count = len(sku_warehouse_map)
-                        tasks.append(
-                            {
-                                "type": "warehouse1",
-                                "date": date.isoformat(),
-                                "sku_map": sku_warehouse_map,
-                                "solid_map": sku_solid_map if sku_solid_map else None,
-                                "assort_map": sku_assort_map if sku_assort_map else None,
-                                "ratio_map": sku_ratio_map if sku_ratio_map else None,
-                                "box_map": sku_box_map if sku_box_map else None,
-                            }
-                        )
-                    else:
-                        warehouse1_count = update_warehouse_stock(
-                            conn,
-                            date.isoformat(),
-                            sku_warehouse_map,
-                            warehouse_num=1,
-                            solid_map=sku_solid_map if sku_solid_map else None,
-                            assort_map=sku_assort_map if sku_assort_map else None,
-                            assort_ratio_map=sku_ratio_map if sku_ratio_map else None,
-                            assort_box_map=sku_box_map if sku_box_map else None,
-                        )
-                        conn.commit()
-                    total_wh = sum(sku_warehouse_map.values())
-                    total_solid_sum = sum(sku_solid_map.values())
-                    total_assort_sum = sum(sku_assort_map.values())
-                    print(f"[INFO] 항만 업로드: {len(sku_warehouse_map)}개 SKU")
-                    print(
-                        f"[INFO] 솔리드: {total_solid_sum}, 아소트: {total_assort_sum}, 합계: {total_wh}"
-                    )
-                    print(f"[INFO] 업데이트된 SKU: {warehouse1_count}개")
-                else:
-                    flash("⚠️ 항만 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
-            else:
-                flash("항만 물류센터: Excel 파일만 지원됩니다.", "warning")
-
-        # 3. 물류센터2(부평) 재고 업로드 (선택사항)
-        warehouse2_count = 0
-        if warehouse_file2 and warehouse_file2.filename:
-            warehouse2_filename = warehouse_file2.filename or ""
-            warehouse2_ext = os.path.splitext(warehouse2_filename)[1].lower()
-
-            if warehouse2_ext in [".xlsx", ".xls", ".xlsb"]:
-                warehouse2_df = pd.read_excel(
-                    warehouse_file2, sheet_name=(warehouse2_sheet or 0)
-                )
-                warehouse2_df.columns = [str(c).strip() for c in warehouse2_df.columns]
-                print(f"[INFO] 부평 엑셀 컬럼: {warehouse2_df.columns.tolist()}")
-                print(f"[INFO] 부평 엑셀 행 수: {len(warehouse2_df)}")
-
-                def _wh2_cell_int(val, default=0) -> int:
-                    try:
-                        if val is None or (isinstance(val, float) and pd.isna(val)):
-                            return default
-                        return int(float(val))
-                    except (TypeError, ValueError):
-                        return default
-
-                sku_warehouse2_map = {}
-                sku_solid2_map = {}
-                sku_assort2_map = {}
-                sku_ratio2_map = {}
-                sku_box2_map = {}
-
-                for _, row in warehouse2_df.iterrows():
-                    sku = str(row.get("상품", "") or "").strip()
-                    if not sku or len(sku) != 15:
-                        continue
-
-                    solid = _wh2_cell_int(row.get("솔리드가용재고", 0))
-                    assort = _wh2_cell_int(
-                        row.get("아소트 가용재고", row.get("아소트가용재고", 0))
-                    )
-                    ratio = _wh2_cell_int(row.get("아소트비율", 0))
-                    box_count = _wh2_cell_int(row.get("아소트박스수", 0))
-                    total = solid + assort
-
-                    sku_warehouse2_map[sku] = total
-                    sku_solid2_map[sku] = solid
-                    sku_assort2_map[sku] = assort
-                    if ratio > 0:
-                        sku_ratio2_map[sku] = ratio
-                    if box_count > 0:
-                        sku_box2_map[sku] = box_count
-
-                if sku_warehouse2_map:
-                    if USE_POSTGRES:
-                        warehouse2_count = len(sku_warehouse2_map)
-                        tasks.append(
-                            {
-                                "type": "warehouse2",
-                                "date": date.isoformat(),
-                                "sku_map": sku_warehouse2_map,
-                                "solid_map": sku_solid2_map if sku_solid2_map else None,
-                                "assort_map": sku_assort2_map if sku_assort2_map else None,
-                                "ratio_map": sku_ratio2_map if sku_ratio2_map else None,
-                                "box_map": sku_box2_map if sku_box2_map else None,
-                            }
-                        )
-                    else:
-                        warehouse2_count = update_warehouse_stock(
-                            conn,
-                            date.isoformat(),
-                            sku_warehouse2_map,
-                            warehouse_num=2,
-                            solid_map=sku_solid2_map if sku_solid2_map else None,
-                            assort_map=sku_assort2_map if sku_assort2_map else None,
-                            assort_ratio_map=sku_ratio2_map if sku_ratio2_map else None,
-                            assort_box_map=sku_box2_map if sku_box2_map else None,
-                        )
-                        conn.commit()
-                    total_wh2 = sum(sku_warehouse2_map.values())
-                    total_solid2_sum = sum(sku_solid2_map.values())
-                    total_assort2_sum = sum(sku_assort2_map.values())
-                    print(f"[INFO] 부평 업로드: {len(sku_warehouse2_map)}개 SKU")
-                    print(
-                        f"[INFO] 솔리드: {total_solid2_sum}, 아소트: {total_assort2_sum}, 합계: {total_wh2}"
-                    )
-                    print(f"[INFO] 업데이트된 SKU: {warehouse2_count}개")
-                else:
-                    flash("⚠️ 부평 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
-            else:
-                flash("부평 물류센터: Excel 파일만 지원됩니다.", "warning")
-        
-        # 4. 매장 재고 업로드 (선택사항)
-        channel_count = 0
-        if channel_file and channel_file.filename:
-            channel_filename = channel_file.filename or ""
-            channel_ext = os.path.splitext(channel_filename)[1].lower()
-            
-            if channel_ext in [".xlsx", ".xls", ".xlsb"]:
-                channel_df = pd.read_excel(channel_file, sheet_name=(channel_sheet or 0))
-                print(f"[INFO] 매장재고 엑셀 컬럼: {channel_df.columns.tolist()}")
-                print(f"[INFO] 매장재고 엑셀 행 수: {len(channel_df)}")
-                
-                channel_snap = normalize_excel(channel_df, snapshot_date=date)
-                print(f"[INFO] 정규화 후 행 수: {len(channel_snap)}")
-                
-                if channel_snap.empty:
-                    flash("⚠️ 매장재고 파일에서 유효한 데이터를 찾을 수 없습니다.", "warning")
-                else:
-                    # SKU와 매장재고 매핑
-                    sku_channel_map = {}
-                    for _, row in channel_snap.iterrows():
-                        sku = str(row["sku"]).strip()
-                        channel_stock = int(row.get("channel_stock") or 0)
-                        if sku and len(sku) == 15:
-                            sku_channel_map[sku] = channel_stock
-                    
-                    if sku_channel_map:
-                        if USE_POSTGRES:
-                            channel_count = len(sku_channel_map)
-                            tasks.append(
-                                {
-                                    "type": "channel",
-                                    "date": date.isoformat(),
-                                    "sku_map": sku_channel_map,
-                                }
-                            )
-                        else:
-                            channel_count = update_channel_stock(
-                                conn, date.isoformat(), sku_channel_map
-                            )
-                            conn.commit()
-                        total_channel = sum(sku_channel_map.values())
-                        print(f"[INFO] 매장재고 업로드: {len(sku_channel_map)}개 SKU, 총 재고: {total_channel}")
-                        print(f"[INFO] 업데이트된 SKU: {channel_count}개")
-                    else:
-                        flash("⚠️ 매장재고 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
-            else:
-                flash("매장재고: Excel 파일만 지원됩니다.", "warning")
-        
-        # 5. 분배내역 업로드 (선택사항)
-        distribution_count = 0
-        if distribution_file and distribution_file.filename:
-            distribution_filename = distribution_file.filename or ""
-            distribution_ext = os.path.splitext(distribution_filename)[1].lower()
-            if distribution_ext in [".xlsx", ".xls", ".xlsb"]:
-                try:
-                    dist_df = pd.read_excel(distribution_file, sheet_name=(distribution_sheet or 0))
-                    dist_df.columns = [str(c).strip() for c in dist_df.columns]
-                    # SKU 컬럼 후보: SKU, 상품코드, 상품, 품목코드
-                    sku_col = None
-                    for col in ["SKU", "상품코드", "상품", "품목코드", "sku"]:
-                        if col in dist_df.columns:
-                            sku_col = col
-                            break
-                    # 분배량 컬럼 우선 (N열 등): 분배량, 수량, N열 → 수량 합계로 표시
-                    qty_col = None
-                    for col in ["분배량", "수량", "분배수량"]:
-                        if col in dist_df.columns:
-                            qty_col = col
-                            break
-                    if not qty_col and len(dist_df.columns) >= 14:
-                        # N열 = 14번째 컬럼(인덱스 13)
-                        qty_col = dist_df.columns[13]
-                    # 텍스트 비고 컬럼 (분배량 없을 때 대체)
-                    note_col = None
-                    for col in ["분배내역", "비고", "메모", "내역", "분배요청내역", "분배요청", "비고사항"]:
-                        if col in dist_df.columns:
-                            note_col = col
-                            break
-                    use_qty = qty_col is not None
-                    use_note = note_col is not None and not use_qty
-                    if sku_col and (use_qty or use_note):
-                        sku_note_map = {}
-                        for _, row in dist_df.iterrows():
-                            sku_raw = str(row.get(sku_col, "")).strip()
-                            sku = sku_raw[:15] if len(sku_raw) >= 15 else sku_raw
-                            if not sku or sku == "nan":
-                                continue
-                            if use_qty:
-                                val = row.get(qty_col)
-                                qty = int(pd.to_numeric(val, errors="coerce")) if not pd.isna(val) else 0
-                                if sku in sku_note_map:
-                                    sku_note_map[sku] = sku_note_map[sku] + qty
-                                else:
-                                    sku_note_map[sku] = qty
-                            else:
-                                note_val = row.get(note_col)
-                                note = "" if pd.isna(note_val) else str(note_val).strip()
-                                if sku in sku_note_map:
-                                    sku_note_map[sku] = sku_note_map[sku] + " / " + note
-                                else:
-                                    sku_note_map[sku] = note
-                        if use_qty:
-                            sku_note_map = {k: str(v) for k, v in sku_note_map.items()}
-                        if sku_note_map:
-                            if USE_POSTGRES:
-                                distribution_count = len(sku_note_map)
-                                tasks.append(
-                                    {
-                                        "type": "distribution",
-                                        "date": date.isoformat(),
-                                        "sku_map": sku_note_map,
-                                    }
-                                )
-                            else:
-                                distribution_count = update_distribution_note(
-                                    conn, date.isoformat(), sku_note_map
-                                )
-                                conn.commit()
-                            print(f"[INFO] 분배내역 업로드: {distribution_count}개 SKU 반영 (분배량 기준)" if use_qty else f"[INFO] 분배내역 업로드: {distribution_count}개 SKU 반영")
-                    else:
-                        flash("⚠️ 분배내역 파일에 SKU(또는 상품코드) 컬럼과 분배량(또는 N열/수량) 컬럼이 필요합니다.", "warning")
-                except Exception as ex:
-                    flash(f"⚠️ 분배내역 파일 처리 중 오류: {ex}", "warning")
-            else:
-                flash("분배내역: Excel 파일만 지원됩니다.", "warning")
-        
-        # 6. 옴니판매불가 SKU 업로드 (선택사항)
-        omni_count = 0
-        if omni_file and omni_file.filename:
-            omni_filename = omni_file.filename or ""
-            omni_ext = os.path.splitext(omni_filename)[1].lower()
-            if omni_ext in [".xlsx", ".xls", ".xlsb"]:
-                try:
-                    sheet = omni_sheet or 0
-                    read_kwargs = {"sheet_name": sheet}
-                    if omni_ext == ".xls":
-                        try:
-                            import xlrd  # noqa: F401
-                            read_kwargs["engine"] = "xlrd"
-                        except ImportError:
-                            raise ImportError(
-                                "옴니판매불가 .xls 파일을 읽으려면 xlrd 패키지가 필요합니다. "
-                                "pip install xlrd 후 다시 시도하거나, 엑셀에서 .xlsx 형식으로 저장해 주세요."
-                            )
-                    omni_df = pd.read_excel(omni_file, **read_kwargs)
-                    
-                    if omni_df.shape[1] < 8:
-                        flash("⚠️ 옴니판매불가 파일에 필요한 열(C,D,E,H)이 부족합니다.", "warning")
-                    else:
-                        df = omni_df.copy()
-                        # C열=매장명, D열=스타일코드, E열=단품코드, H열=판매불가 수량
-                        store_col = df.columns[2]
-                        style_col = df.columns[3]
-                        sku_col = df.columns[4]
-                        blocked_col = df.columns[7]
-                        
-                        df["store_name"] = df[store_col].astype(str).str.strip()
-                        df["style_code"] = df[style_col].astype(str).str.strip()
-                        df["sku_code"] = df[sku_col].astype(str).str.strip()
-                        df["blocked_qty"] = (
-                            pd.to_numeric(df[blocked_col], errors="coerce")
-                            .fillna(0)
-                            .astype(int)
-                        )
-                        
-                        df = df[
-                            (df["style_code"] != "")
-                            & (df["sku_code"] != "")
-                            & (df["blocked_qty"] > 0)
-                        ].copy()
-                        
-                        if df.empty:
-                            flash("⚠️ 옴니판매불가 파일에서 유효한 데이터를 찾을 수 없습니다.", "warning")
-                        else:
-                            # 스타일/단품별 판매불가 수량 합계
-                            summary = (
-                                df.groupby(["style_code", "sku_code"], as_index=False)["blocked_qty"]
-                                .sum()
-                            )
-                            
-                            # 스타일/단품/매장별 합계 후, 각 쌍에서 가장 큰 매장 선택
-                            store_agg = (
-                                df.groupby(
-                                    ["style_code", "sku_code", "store_name"], as_index=False
-                                )["blocked_qty"]
-                                .sum()
-                            )
-                            store_agg = store_agg.sort_values(
-                                ["style_code", "sku_code", "blocked_qty"],
-                                ascending=[True, True, False],
-                            )
-                            top_store_df = store_agg.drop_duplicates(
-                                subset=["style_code", "sku_code"], keep="first"
-                            ).rename(
-                                columns={"store_name": "top_store"}
-                            )
-                            
-                            omni_join = summary.merge(
-                                top_store_df[["style_code", "sku_code", "top_store"]],
-                                on=["style_code", "sku_code"],
-                                how="left",
-                            )
-                            
-                            # 기존 데이터 삭제 후 삽입
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    "DELETE FROM omni_blocked WHERE snapshot_date = %s",
-                                    (date.isoformat(),),
-                                )
-                                rows = [
-                                    (
-                                        date.isoformat(),
-                                        str(r["style_code"]),
-                                        str(r["sku_code"]),
-                                        int(r["blocked_qty"]),
-                                        str(r.get("top_store") or ""),
-                                    )
-                                    for _, r in omni_join.iterrows()
-                                ]
-                                cur.executemany(
-                                    """
-                                    INSERT INTO omni_blocked (
-                                        snapshot_date, style_code, sku_code, blocked_qty, top_store
-                                    ) VALUES (%s, %s, %s, %s, %s)
-                                    """,
-                                    rows,
-                                )
-                            conn.commit()
-                            omni_count = len(rows)
-                            print(f"[INFO] 옴니판매불가 업로드: {omni_count}개 단품")
-                except Exception as ex:
-                    flash(f"⚠️ 옴니판매불가 파일 처리 중 오류: {ex}", "warning")
-            else:
-                flash("옴니판매불가: Excel 파일만 지원됩니다.", "warning")
-        
-        if USE_POSTGRES and tasks:
-            thread = threading.Thread(
-                target=_run_upload_background,
-                args=(tasks, cache),
-                daemon=True,
-            )
-            thread.start()
-            cache_cleared_in_background = True
-            flash("✅ 업로드 시작됨 (1~2분 후 대시보드에 반영됩니다)", "success")
-
-            if "failed_count" in session and session["failed_count"] > 0:
-                flash(
-                    f"⚠️ {session['failed_count']}개 행이 업로드 실패했습니다. 상단 배너에서 실패 목록을 다운로드하세요.",
-                    "warning",
-                )
-
-            upload_success = True
-            return redirect(url_for("dashboard"))
-
-        # 결과 메시지
-        total_warehouse_count = warehouse1_count + warehouse2_count
-        msg_parts = []
-        if sales_count > 0:
-            msg_parts.append(f"상품분석판매: {sales_count}개 품목")
-        if warehouse1_count > 0:
-            msg_parts.append(f"항만: {warehouse1_count}개 SKU")
-        if warehouse2_count > 0:
-            msg_parts.append(f"부평: {warehouse2_count}개 SKU")
-        if channel_count > 0:
-            msg_parts.append(f"매장재고: {channel_count}개 SKU")
-        if distribution_count > 0:
-            msg_parts.append(f"분배내역: {distribution_count}개 SKU")
-        if 'omni_count' in locals() and omni_count > 0:
-            msg_parts.append(f"옴니판매불가: {omni_count}개 단품")
-        if not msg_parts:
-            msg_parts.append("변경된 항목 없음")
-        
-        success_msg = f"✅ {', '.join(msg_parts)} 업로드 완료 (날짜: {date})"
-        flash(success_msg, "success")
-
-        # 실패한 행이 있으면 알림 (다운로드는 상단 배너에서 가능)
-        if 'failed_count' in session and session['failed_count'] > 0:
-            flash(f"⚠️ {session['failed_count']}개 행이 업로드 실패했습니다. 상단 배너에서 실패 목록을 다운로드하세요.", "warning")
-
-        upload_success = True
-        return redirect(url_for("dashboard"))
-
-    except Exception as e:
-        flash(f"업로드 실패: {e}", "danger")
-        traceback.print_exc()
+    if not files_data:
+        flash("최소 하나 이상의 파일을 선택하세요.", "danger")
         return redirect(url_for("upload_get"))
-    finally:
-        if upload_success and not cache_cleared_in_background:
-            cache.clear()
-        if conn:
-            conn.close()
+
+    thread = threading.Thread(
+        target=_process_upload_background,
+        args=(files_data, date.isoformat(), cache),
+        daemon=True,
+    )
+    thread.start()
+
+    flash("✅ 업로드 시작됨. 파일 크기에 따라 1~3분 후 대시보드에 반영됩니다.", "success")
+    return redirect(url_for("dashboard"))
 
 
 def _status_badge(status: str) -> str:
