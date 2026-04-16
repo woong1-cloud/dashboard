@@ -19,11 +19,25 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "inventory.db"),
 )
 USE_POSTGRES = bool(DATABASE_URL)
+_engine = None
 
 
 def _postgres_dsn_with_encoding() -> str:
     sep = "&" if "?" in DATABASE_URL else "?"
     return DATABASE_URL + sep + "client_encoding=utf8"
+
+
+def _get_engine():
+    """pd.read_sql_query용 SQLAlchemy 엔진 반환"""
+    global _engine
+    if _engine is None:
+        from sqlalchemy import create_engine
+
+        if USE_POSTGRES:
+            _engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        else:
+            _engine = create_engine(f"sqlite:///{DB_PATH}")
+    return _engine
 
 
 @dataclass(frozen=True)
@@ -841,7 +855,7 @@ def load_latest(conn: Union[PGConnection, sqlite3.Connection]) -> tuple[Optional
     latest = row[0] if row else None
     if not latest:
         return None, pd.DataFrame()
-    df = pd.read_sql_query(SNAPSHOT_SELECT_SQL, conn, params=(latest,))
+    df = pd.read_sql_query(SNAPSHOT_SELECT_SQL, _get_engine(), params=(latest,))
     return latest, df
 
 
@@ -851,7 +865,7 @@ def load_history(conn: Union[PGConnection, sqlite3.Connection], sku: str) -> pd.
         q = q.replace("%s", "?")
     return pd.read_sql_query(
         q,
-        conn,
+        _get_engine(),
         params=(sku,),
     )
 

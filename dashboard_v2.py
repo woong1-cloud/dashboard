@@ -33,6 +33,7 @@ from flask_caching import Cache
 
 from inventory_core import (
     DATABASE_URL,
+    _get_engine,
     avg_daily_usage_from_history,
     compute_daily_change,
     get_conn,
@@ -772,7 +773,7 @@ def export_fillup():
                    COALESCE(warehouse2_assort, 0) AS warehouse2_assort
             FROM snapshots WHERE snapshot_date = %s
             """,
-            conn,
+            _get_engine(),
             params=(latest_date,),
         )
         for c in ("warehouse1_solid", "warehouse1_assort", "warehouse2_solid", "warehouse2_assort"):
@@ -1674,7 +1675,7 @@ def _sql_prev_item_stock_totals(
         GROUP BY UPPER(SUBSTR(TRIM(sku), 3, 2))
         HAVING LENGTH(TRIM(UPPER(SUBSTR(TRIM(sku), 3, 2)))) > 0
     """
-    return pd.read_sql_query(sql, conn, params=params)
+    return pd.read_sql_query(sql, _get_engine(), params=params)
 
 
 def _build_item_inventory_summary(
@@ -1704,7 +1705,7 @@ def _build_item_inventory_summary(
         ORDER BY snapshot_date DESC
         LIMIT 2
         """,
-        conn,
+        _get_engine(),
     )
     if dates_df.empty:
         return [], None, False
@@ -2062,7 +2063,7 @@ def _load_base_data() -> dict:
                 FROM omni_blocked
                 WHERE snapshot_date = %s
                 """,
-                conn,
+                _get_engine(),
                 params=(latest_date,),
             )
             if not omni_df.empty:
@@ -2416,10 +2417,10 @@ def clear_data():
         conn = get_conn()
         try:
             total_count = pd.read_sql_query(
-                "SELECT COUNT(*) as cnt FROM snapshots", conn
+                "SELECT COUNT(*) as cnt FROM snapshots", _get_engine()
             ).iloc[0]["cnt"]
             dates_count = pd.read_sql_query(
-                "SELECT COUNT(DISTINCT snapshot_date) as cnt FROM snapshots", conn
+                "SELECT COUNT(DISTINCT snapshot_date) as cnt FROM snapshots", _get_engine()
             ).iloc[0]["cnt"]
         finally:
             conn.close()
