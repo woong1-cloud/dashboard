@@ -20,6 +20,11 @@ DB_PATH = os.environ.get(
 USE_POSTGRES = bool(DATABASE_URL)
 
 
+def _postgres_dsn_with_encoding() -> str:
+    sep = "&" if "?" in DATABASE_URL else "?"
+    return DATABASE_URL + sep + "client_encoding=utf8"
+
+
 @dataclass(frozen=True)
 class CoreConfig:
     default_lead_time_days: int = 7
@@ -43,7 +48,8 @@ if not USE_POSTGRES:
 
 def init_db() -> None:
     if USE_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = psycopg2.connect(_postgres_dsn_with_encoding())
+        conn.set_client_encoding("UTF8")
     else:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     try:
@@ -163,7 +169,8 @@ def init_db() -> None:
 
 def get_conn() -> Union[PGConnection, sqlite3.Connection]:
     if USE_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = psycopg2.connect(_postgres_dsn_with_encoding())
+        conn.set_client_encoding("UTF8")
         conn.autocommit = False
         return conn
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -446,8 +453,8 @@ def _row_to_upsert_tuple(r: dict) -> tuple:
         return s if s else None
 
     return (
-        str(r["snapshot_date"]),
-        str(r["sku"]),
+        _s(r.get("snapshot_date")),
+        _s(r.get("sku")),
         _s(r.get("name")),
         _s(r.get("category")),
         _i(r.get("stock"), 0),
@@ -459,7 +466,7 @@ def _row_to_upsert_tuple(r: dict) -> tuple:
         _i(r.get("lead_time_days"), CFG.default_lead_time_days),
         _i(r.get("safety_stock"), CFG.default_safety_stock),
         _i(r.get("sales_qty"), 0),
-        str(r.get("updated_at") or ""),
+        _s(r.get("updated_at")),
     )
 
 
