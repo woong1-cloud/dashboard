@@ -7,6 +7,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import re
+import threading
 import traceback
 from urllib.parse import urlencode
 from collections import defaultdict
@@ -158,6 +159,10 @@ def fetch_gsheet_as_dataframe(url_or_id: str, sheet_name: str = "재고판매현
 
 # 팀 배포 모드: True면 초기화 기능 비활성화, /test 비노출, 500 에러 시 상세 미표시
 DEPLOY_MODE = os.environ.get("DEPLOY_MODE", "").strip().lower() in ("1", "true", "yes")
+
+# 구글 시트 DB 최신화 중복 실행 방지 (대용량 upsert 시 SQLite 락 완화와 함께 사용)
+_sync_lock = threading.Lock()
+_sync_in_progress = False
 
 
 def create_app() -> Flask:
@@ -993,59 +998,76 @@ def settings_gsheet_save():
 @login_required
 def gsheet_sync_post():
     """저장된 구글 시트에서 1번(상품분석판매)만 읽어 해당 스냅샷 날짜로 DB 갱신"""
-    saved = _get_gsheet_settings()
-    url = (saved.get("url") or "").strip()
-    sheet = (saved.get("sheet") or "재고판매현황").strip() or "재고판매현황"
-    if not url:
-        flash("구글 시트 연동 URL이 없습니다. 업로드 페이지에서 먼저 저장하세요.", "danger")
+    global _sync_in_progress
+
+    if _sync_in_progress:
+        flash("⚠️ 이미 DB 최신화가 진행 중입니다. 잠시 후 다시 시도하세요.", "warning")
         return redirect(request.referrer or url_for("dashboard"))
 
-    snap_raw = (request.form.get("snapshot_date") or "").strip()
-    try:
-        date = dt.date.fromisoformat(snap_raw) if snap_raw else dt.date.today()
-    except ValueError:
-        flash("날짜 형식이 올바르지 않습니다(YYYY-MM-DD).", "danger")
+    if not _sync_lock.acquire(blocking=False):
+        flash("⚠️ 이미 DB 최신화가 진행 중입니다.", "warning")
         return redirect(request.referrer or url_for("dashboard"))
 
+    _sync_in_progress = True
+    conn = None
     ref = request.referrer or url_for("dashboard")
     try:
-        conn = get_conn()
-        sales_df = fetch_gsheet_as_dataframe(url, sheet_name=sheet)
-        print(f"[INFO] DB 최신화(구글시트): {len(sales_df)}행")
+        saved = _get_gsheet_settings()
+        url = (saved.get("url") or "").strip()
+        sheet = (saved.get("sheet") or "재고판매현황").strip() or "재고판매현황"
+        if not url:
+            flash("구글 시트 연동 URL이 없습니다. 업로드 페이지에서 먼저 저장하세요.", "danger")
+            return redirect(ref)
 
-        result = normalize_excel(sales_df, snapshot_date=date, return_failed=True)
-        if isinstance(result, tuple):
-            sales_snap, failed_df = result
-            if not failed_df.empty:
-                failed_csv_path = f"failed_upload_{date.isoformat()}.csv"
-                failed_df.to_csv(failed_csv_path, index=False, encoding="utf-8-sig")
-                session["failed_csv_path"] = failed_csv_path
-                session["failed_count"] = len(failed_df)
+        snap_raw = (request.form.get("snapshot_date") or "").strip()
+        try:
+            date = dt.date.fromisoformat(snap_raw) if snap_raw else dt.date.today()
+        except ValueError:
+            flash("날짜 형식이 올바르지 않습니다(YYYY-MM-DD).", "danger")
+            return redirect(ref)
+
+        try:
+            conn = get_conn()
+            sales_df = fetch_gsheet_as_dataframe(url, sheet_name=sheet)
+            print(f"[INFO] DB 최신화(구글시트): {len(sales_df)}행")
+
+            result = normalize_excel(sales_df, snapshot_date=date, return_failed=True)
+            if isinstance(result, tuple):
+                sales_snap, failed_df = result
+                if not failed_df.empty:
+                    failed_csv_path = f"failed_upload_{date.isoformat()}.csv"
+                    failed_df.to_csv(failed_csv_path, index=False, encoding="utf-8-sig")
+                    session["failed_csv_path"] = failed_csv_path
+                    session["failed_count"] = len(failed_df)
+                else:
+                    session.pop("failed_csv_path", None)
+                    session.pop("failed_count", None)
             else:
+                sales_snap = result
                 session.pop("failed_csv_path", None)
                 session.pop("failed_count", None)
-        else:
-            sales_snap = result
-            session.pop("failed_csv_path", None)
-            session.pop("failed_count", None)
 
-        sales_count = upsert_snapshot(conn, sales_snap)
-        _invalidate_snapshot_caches()
-        flash(
-            f"✅ DB 최신화 완료: 구글 시트 → {sales_count}개 품목 반영 (기준일 {date})",
-            "success",
-        )
-        if session.get("failed_count"):
+            sales_count = upsert_snapshot(conn, sales_snap)
+            _invalidate_snapshot_caches()
             flash(
-                f"⚠️ {session['failed_count']}개 행은 반영되지 않았습니다. 실패 목록을 다운로드하세요.",
-                "warning",
+                f"✅ DB 최신화 완료: 구글 시트 → {sales_count}개 품목 반영 (기준일 {date})",
+                "success",
             )
-    except Exception as e:
-        flash(f"DB 최신화 실패: {e}", "danger")
-        import traceback
-        traceback.print_exc()
+            if session.get("failed_count"):
+                flash(
+                    f"⚠️ {session['failed_count']}개 행은 반영되지 않았습니다. 실패 목록을 다운로드하세요.",
+                    "warning",
+                )
+        except Exception as e:
+            flash(f"DB 최신화 실패: {e}", "danger")
+            traceback.print_exc()
 
-    return redirect(ref)
+        return redirect(ref)
+    finally:
+        _sync_in_progress = False
+        _sync_lock.release()
+        if conn:
+            conn.close()
 
 
 @app.get("/upload")

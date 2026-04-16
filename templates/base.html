@@ -21,7 +21,8 @@
           </a>
           {% if session.get('authed') and has_gsheet_saved %}
           <form method="post" action="{{ url_for('gsheet_sync_post') }}" class="d-inline"
-                title="저장된 구글 시트(1번 상품분석판매)만 다시 읽어 DB에 반영합니다. 물류·매장 엑셀은 포함되지 않습니다.">
+                title="저장된 구글 시트(1번 상품분석판매)만 다시 읽어 DB에 반영합니다. 물류·매장 엑셀은 포함되지 않습니다."
+                onsubmit="var b=this.querySelector('button[type=submit]'); if(b){ b.disabled=true; b.textContent='최신화 중...'; }">
             <input type="hidden" name="snapshot_date" value="{{ gsheet_sync_snapshot_default }}" />
             <button type="submit" class="btn btn-sm btn-success">
               <i class="bi bi-arrow-repeat"></i> DB 최신화

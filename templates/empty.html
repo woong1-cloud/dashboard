@@ -9,7 +9,8 @@
           <a class="btn btn-primary" href="{{ url_for('upload_get') }}">엑셀·업로드로 이동</a>
           {% if session.get('authed') and has_gsheet_saved %}
           <form method="post" action="{{ url_for('gsheet_sync_post') }}" class="d-inline"
-                title="저장된 구글 시트(또는 기본 시트)를 읽어 오늘 날짜 스냅샷으로 DB에 반영합니다.">
+                title="저장된 구글 시트(또는 기본 시트)를 읽어 오늘 날짜 스냅샷으로 DB에 반영합니다."
+                onsubmit="var b=this.querySelector('button[type=submit]'); if(b){ b.disabled=true; b.textContent='최신화 중...'; }">
             <input type="hidden" name="snapshot_date" value="{{ gsheet_sync_snapshot_default }}" />
             <button type="submit" class="btn btn-success">
               <i class="bi bi-arrow-repeat"></i> DB 최신화

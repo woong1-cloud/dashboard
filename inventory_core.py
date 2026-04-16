@@ -36,6 +36,8 @@ def init_db(db_path: str = DB_PATH) -> None:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA cache_size=10000;")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -140,6 +142,8 @@ def get_conn(db_path: str = DB_PATH) -> sqlite3.Connection:
     # [최적화] 연결만 생성; 스키마는 init_db에서 처리
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA cache_size=10000;")
     return conn
 
 
@@ -390,8 +394,11 @@ def normalize_excel(df: pd.DataFrame, snapshot_date: dt.date, return_failed: boo
 
 def upsert_snapshot(conn: sqlite3.Connection, snap: pd.DataFrame) -> int:
     rows = snap.to_dict(orient="records")
-    conn.executemany(
-        """
+    if not rows:
+        return 0
+
+    BATCH_SIZE = 1000
+    upsert_sql = """
         INSERT INTO snapshots (
             snapshot_date, sku, name, category, stock, channel_stock, warehouse_stock, warehouse1_stock, warehouse2_stock, 
             min_stock, lead_time_days, safety_stock, sales_qty, updated_at
@@ -412,25 +419,27 @@ def upsert_snapshot(conn: sqlite3.Connection, snap: pd.DataFrame) -> int:
             safety_stock=excluded.safety_stock,
             sales_qty=excluded.sales_qty,
             updated_at=excluded.updated_at
+        """
+    total = 0
+    for i in range(0, len(rows), BATCH_SIZE):
+        batch = rows[i : i + BATCH_SIZE]
+        conn.executemany(upsert_sql, batch)
+        conn.commit()
+        total += len(batch)
+
+    # 모든 스냅샷에 대해 warehouse_stock 재계산 (항만 + 부평)
+    snapshot_date = rows[0].get("snapshot_date")
+    conn.execute(
+        """
+        UPDATE snapshots
+        SET warehouse_stock = COALESCE(warehouse1_stock, 0) + COALESCE(warehouse2_stock, 0)
+        WHERE snapshot_date = ?
         """,
-        rows,
+        (snapshot_date,),
     )
     conn.commit()
-    
-    # 모든 스냅샷에 대해 warehouse_stock 재계산 (항만 + 부평)
-    if rows:
-        snapshot_date = rows[0].get("snapshot_date")
-        conn.execute(
-            """
-            UPDATE snapshots
-            SET warehouse_stock = COALESCE(warehouse1_stock, 0) + COALESCE(warehouse2_stock, 0)
-            WHERE snapshot_date = ?
-            """,
-            (snapshot_date,)
-        )
-        conn.commit()
-    
-    return len(rows)
+
+    return total
 
 
 def update_channel_stock(conn: sqlite3.Connection, snapshot_date: str, sku_channel_map: dict) -> int:
