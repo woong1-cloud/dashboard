@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -44,6 +45,33 @@ FROM snapshots WHERE snapshot_date = %s
 """
 if not USE_POSTGRES:
     SNAPSHOT_SELECT_SQL = SNAPSHOT_SELECT_SQL.replace("%s", "?")
+
+
+def _to_python(val):
+    """numpy/pandas 타입 -> Python 기본 타입 변환"""
+    if val is None:
+        return None
+    try:
+        import numpy as np
+
+        if isinstance(val, (np.integer,)):
+            return int(val)
+        if isinstance(val, (np.floating,)):
+            return None if math.isnan(float(val)) else float(val)
+        if isinstance(val, np.bool_):
+            return bool(val)
+    except ImportError:
+        pass
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    if isinstance(val, (bytes, bytearray)):
+        return val.decode("utf-8", errors="replace")
+    return val
 
 
 def init_db() -> None:
@@ -471,8 +499,7 @@ def _row_to_upsert_tuple(r: dict) -> tuple:
 
 
 def upsert_snapshot(conn: Union[PGConnection, sqlite3.Connection], snap: pd.DataFrame) -> int:
-    rows = snap.to_dict(orient="records")
-    if not rows:
+    if snap.empty:
         return 0
 
     BATCH_SIZE = 1000
@@ -500,7 +527,26 @@ def upsert_snapshot(conn: Union[PGConnection, sqlite3.Connection], snap: pd.Data
             updated_at = EXCLUDED.updated_at
         """
     total = 0
-    tuples = [_row_to_upsert_tuple(r) for r in rows]
+    tuples = []
+    for row in snap.itertuples(index=False):
+        tuples.append(
+            (
+                _to_python(row.snapshot_date),
+                _to_python(row.sku),
+                _to_python(row.name),
+                _to_python(row.category),
+                _to_python(row.stock),
+                _to_python(row.channel_stock),
+                _to_python(row.warehouse_stock),
+                _to_python(row.warehouse1_stock),
+                _to_python(row.warehouse2_stock),
+                _to_python(row.min_stock),
+                _to_python(row.lead_time_days),
+                _to_python(row.safety_stock),
+                _to_python(row.sales_qty),
+                _to_python(row.updated_at),
+            )
+        )
     with conn.cursor() as cur:
         for i in range(0, len(tuples), BATCH_SIZE):
             batch = tuples[i : i + BATCH_SIZE]
@@ -508,7 +554,7 @@ def upsert_snapshot(conn: Union[PGConnection, sqlite3.Connection], snap: pd.Data
             total += len(batch)
     conn.commit()
 
-    snapshot_date = rows[0].get("snapshot_date")
+    snapshot_date = _to_python(snap.iloc[0]["snapshot_date"])
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -531,7 +577,12 @@ def update_channel_stock(
         return 0
     now = dt.datetime.now().isoformat(timespec="seconds")
     rows = [
-        (channel_stock, now, snapshot_date, sku)
+        (
+            _to_python(channel_stock),
+            _to_python(now),
+            _to_python(snapshot_date),
+            _to_python(sku),
+        )
         for sku, channel_stock in sku_channel_map.items()
     ]
     if not USE_POSTGRES:
@@ -576,7 +627,12 @@ def update_distribution_note(
         return 0
     now = dt.datetime.now().isoformat(timespec="seconds")
     rows = [
-        (note or "", now, snapshot_date, sku)
+        (
+            _to_python(note or ""),
+            _to_python(now),
+            _to_python(snapshot_date),
+            _to_python(sku),
+        )
         for sku, note in sku_note_map.items()
     ]
     if not USE_POSTGRES:
@@ -650,16 +706,16 @@ def update_warehouse_stock(
                         box_ct = int(abm.get(sku, 0) or 0)
                         rows.append(
                             (
-                                warehouse_stock,
-                                w_solid,
-                                w_assort,
-                                ratio,
-                                ratio,
-                                box_ct,
-                                box_ct,
-                                now,
-                                snapshot_date,
-                                sku,
+                                _to_python(warehouse_stock),
+                                _to_python(w_solid),
+                                _to_python(w_assort),
+                                _to_python(ratio),
+                                _to_python(ratio),
+                                _to_python(box_ct),
+                                _to_python(box_ct),
+                                _to_python(now),
+                                _to_python(snapshot_date),
+                                _to_python(sku),
                             )
                         )
                     cur.executemany(
@@ -677,7 +733,12 @@ def update_warehouse_stock(
                     )
                 else:
                     rows = [
-                        (warehouse_stock, now, snapshot_date, sku)
+                        (
+                            _to_python(warehouse_stock),
+                            _to_python(now),
+                            _to_python(snapshot_date),
+                            _to_python(sku),
+                        )
                         for sku, warehouse_stock in sku_warehouse_map.items()
                     ]
                     cur.executemany(
@@ -699,16 +760,16 @@ def update_warehouse_stock(
                         box_ct = int(abm.get(sku, 0) or 0)
                         rows.append(
                             (
-                                warehouse_stock,
-                                w_solid,
-                                w_assort,
-                                ratio,
-                                ratio,
-                                box_ct,
-                                box_ct,
-                                now,
-                                snapshot_date,
-                                sku,
+                                _to_python(warehouse_stock),
+                                _to_python(w_solid),
+                                _to_python(w_assort),
+                                _to_python(ratio),
+                                _to_python(ratio),
+                                _to_python(box_ct),
+                                _to_python(box_ct),
+                                _to_python(now),
+                                _to_python(snapshot_date),
+                                _to_python(sku),
                             )
                         )
                     cur.executemany(
@@ -726,7 +787,12 @@ def update_warehouse_stock(
                     )
                 else:
                     rows = [
-                        (warehouse_stock, now, snapshot_date, sku)
+                        (
+                            _to_python(warehouse_stock),
+                            _to_python(now),
+                            _to_python(snapshot_date),
+                            _to_python(sku),
+                        )
                         for sku, warehouse_stock in sku_warehouse_map.items()
                     ]
                     cur.executemany(
@@ -740,7 +806,12 @@ def update_warehouse_stock(
                 updated = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
             else:
                 rows = [
-                    (warehouse_stock, now, snapshot_date, sku)
+                    (
+                        _to_python(warehouse_stock),
+                        _to_python(now),
+                        _to_python(snapshot_date),
+                        _to_python(sku),
+                    )
                     for sku, warehouse_stock in sku_warehouse_map.items()
                 ]
                 cur.executemany(
