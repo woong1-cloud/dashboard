@@ -1151,15 +1151,23 @@ def upload_post():
         if not gsheet_sheet or gsheet_sheet == "재고판매현황":
             gsheet_sheet = saved.get("sheet", "재고판매현황")
 
-    # 필수 소스 검증
-    if sales_source == "gsheet":
-        if not gsheet_input:
-            flash("구글 시트 URL을 확인할 수 없습니다. 업로드 페이지에서 주소를 저장하거나 다시 시도해 주세요.", "danger")
-            return redirect(url_for("upload_get"))
-    else:
-        if not sales_file or not sales_file.filename:
-            flash("상품분석판매 파일을 선택하세요.", "danger")
-            return redirect(url_for("upload_get"))
+    has_sales_file = sales_source == "gsheet" or (sales_file and sales_file.filename)
+    has_warehouse = (warehouse_file and warehouse_file.filename) or (
+        warehouse_file2 and warehouse_file2.filename
+    )
+    has_channel = channel_file and channel_file.filename
+    has_distribution = distribution_file and distribution_file.filename
+    has_omni = omni_file and omni_file.filename
+
+    if (
+        not has_sales_file
+        and not has_warehouse
+        and not has_channel
+        and not has_distribution
+        and not has_omni
+    ):
+        flash("최소 하나 이상의 파일을 선택하세요.", "danger")
+        return redirect(url_for("upload_get"))
 
     # 날짜 파싱
     try:
@@ -1174,58 +1182,62 @@ def upload_post():
         conn = get_conn()
 
         # 1. 상품분석판매 로드 (파일 업로드 또는 구글 시트)
-        if sales_source == "gsheet":
-            try:
-                sales_df = fetch_gsheet_as_dataframe(gsheet_input, sheet_name=gsheet_sheet)
-                print(f"[INFO] 구글 시트 로드 완료: {len(sales_df)}행, 컬럼: {sales_df.columns.tolist()}")
-            except Exception as gs_err:
-                flash(f"구글 시트 읽기 실패: {gs_err}", "danger")
-                return redirect(url_for("upload_get"))
-        else:
-            sales_filename = sales_file.filename or ""
-            sales_ext = os.path.splitext(sales_filename)[1].lower()
-
-            if sales_ext == ".csv":
+        sales_count = 0
+        if has_sales_file:
+            if sales_source == "gsheet":
+                if not gsheet_input:
+                    flash("구글 시트 URL을 확인할 수 없습니다. 업로드 페이지에서 주소를 저장하거나 다시 시도해 주세요.", "danger")
+                    return redirect(url_for("upload_get"))
                 try:
-                    sales_df = pd.read_csv(sales_file)
-                except UnicodeDecodeError:
-                    sales_file.seek(0)
-                    sales_df = pd.read_csv(sales_file, encoding="cp949")
-            elif sales_ext in [".xlsx", ".xls", ".xlsb"]:
-                sales_df = pd.read_excel(sales_file, sheet_name=0)
+                    sales_df = fetch_gsheet_as_dataframe(gsheet_input, sheet_name=gsheet_sheet)
+                    print(f"[INFO] 구글 시트 로드 완료: {len(sales_df)}행, 컬럼: {sales_df.columns.tolist()}")
+                except Exception as gs_err:
+                    flash(f"구글 시트 읽기 실패: {gs_err}", "danger")
+                    return redirect(url_for("upload_get"))
             else:
-                flash("지원하지 않는 파일 형식입니다. CSV 또는 Excel 파일을 사용하세요.", "danger")
-                return redirect(url_for("upload_get"))
+                sales_filename = sales_file.filename or ""
+                sales_ext = os.path.splitext(sales_filename)[1].lower()
 
-        # return_failed=True로 호출하여 실패한 행도 받기
-        result = normalize_excel(sales_df, snapshot_date=date, return_failed=True)
-        if isinstance(result, tuple):
-            sales_snap, failed_df = result
-            # 실패한 행이 있으면 CSV로 저장
-            if not failed_df.empty:
-                failed_csv_path = f"failed_upload_{date.isoformat()}.csv"
-                failed_df.to_csv(failed_csv_path, index=False, encoding='utf-8-sig')
-                session['failed_csv_path'] = failed_csv_path
-                session['failed_count'] = len(failed_df)
-        else:
-            sales_snap = result
-        
-        if USE_POSTGRES:
-            thread = threading.Thread(
-                target=_run_upsert_background,
-                args=(DATABASE_URL, sales_snap, date, cache),
-                daemon=True,
-            )
-            thread.start()
-            sales_count = len(sales_snap)
-            flash(
-                f"✅ {sales_count}개 품목 업로드 시작됨 (처리 중, 1~2분 후 반영)",
-                "success",
-            )
-            return redirect(url_for("dashboard"))
-        else:
-            sales_count = upsert_snapshot(conn, sales_snap)
-            conn.commit()
+                if sales_ext == ".csv":
+                    try:
+                        sales_df = pd.read_csv(sales_file)
+                    except UnicodeDecodeError:
+                        sales_file.seek(0)
+                        sales_df = pd.read_csv(sales_file, encoding="cp949")
+                elif sales_ext in [".xlsx", ".xls", ".xlsb"]:
+                    sales_df = pd.read_excel(sales_file, sheet_name=0)
+                else:
+                    flash("지원하지 않는 파일 형식입니다. CSV 또는 Excel 파일을 사용하세요.", "danger")
+                    return redirect(url_for("upload_get"))
+
+            # return_failed=True로 호출하여 실패한 행도 받기
+            result = normalize_excel(sales_df, snapshot_date=date, return_failed=True)
+            if isinstance(result, tuple):
+                sales_snap, failed_df = result
+                # 실패한 행이 있으면 CSV로 저장
+                if not failed_df.empty:
+                    failed_csv_path = f"failed_upload_{date.isoformat()}.csv"
+                    failed_df.to_csv(failed_csv_path, index=False, encoding='utf-8-sig')
+                    session['failed_csv_path'] = failed_csv_path
+                    session['failed_count'] = len(failed_df)
+            else:
+                sales_snap = result
+
+            if USE_POSTGRES:
+                thread = threading.Thread(
+                    target=_run_upsert_background,
+                    args=(DATABASE_URL, sales_snap, date, cache),
+                    daemon=True,
+                )
+                thread.start()
+                sales_count = len(sales_snap)
+                flash(
+                    f"✅ {sales_count}개 품목 업로드 시작됨 (처리 중, 1~2분 후 반영)",
+                    "success",
+                )
+            else:
+                sales_count = upsert_snapshot(conn, sales_snap)
+                conn.commit()
 
         # 2. 물류센터1(항만) 재고 업로드 (선택사항) — 물류 전용 컬럼 직접 파싱 (normalize_excel 경유 금지)
         warehouse1_count = 0
@@ -1592,17 +1604,21 @@ def upload_post():
         
         # 결과 메시지
         total_warehouse_count = warehouse1_count + warehouse2_count
-        msg_parts = [f"상품분석판매: {sales_count}개 품목"]
+        msg_parts = []
+        if sales_count > 0:
+            msg_parts.append(f"상품분석판매: {sales_count}개 품목")
         if warehouse1_count > 0:
-            msg_parts.append(f"항만 물류센터: {warehouse1_count}개 SKU")
+            msg_parts.append(f"항만: {warehouse1_count}개 SKU")
         if warehouse2_count > 0:
-            msg_parts.append(f"부평 물류센터: {warehouse2_count}개 SKU")
+            msg_parts.append(f"부평: {warehouse2_count}개 SKU")
         if channel_count > 0:
             msg_parts.append(f"매장재고: {channel_count}개 SKU")
         if distribution_count > 0:
             msg_parts.append(f"분배내역: {distribution_count}개 SKU")
         if 'omni_count' in locals() and omni_count > 0:
             msg_parts.append(f"옴니판매불가: {omni_count}개 단품")
+        if not msg_parts:
+            msg_parts.append("변경된 항목 없음")
         
         success_msg = f"✅ {', '.join(msg_parts)} 업로드 완료 (날짜: {date})"
         flash(success_msg, "success")
