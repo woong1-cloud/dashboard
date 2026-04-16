@@ -52,16 +52,20 @@ cache = Cache()
 
 
 def _invalidate_snapshot_caches() -> None:
-    """스냅샷 데이터 변경 후 dashboard_base·item_summary_* 만 무효화 (전체 clear 지양)."""
+    """스냅샷 데이터 변경 후 dashboard_base·item_summary_*·대시보드 뷰 캐시 무효화."""
     cache.delete("dashboard_base")
     _backend = getattr(cache.cache, "_cache", None)
     if _backend is None:
         cache.clear()
-        # TODO: item_summary 키만 삭제하도록 개선 필요
         return
-    _keys = [k for k in _backend.keys() if str(k).startswith("item_summary_")]
+    _all = list(_backend.keys())
+    _keys = [k for k in _all if str(k).startswith("item_summary_")]
     if _keys:
         cache.delete_many(*_keys)
+    # query_string=True 인 @cache.cached 는 key_prefix 대신 path+쿼리스트링 해시로 키를 씀
+    _view_keys = [k for k in _all if str(k).startswith("/dashboard")]
+    if _view_keys:
+        cache.delete_many(*_view_keys)
 
 
 APP_TITLE = "재고 대시보드 V4"
