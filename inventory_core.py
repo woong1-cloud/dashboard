@@ -546,14 +546,19 @@ def upsert_snapshot(conn: Union[PGConnection, sqlite3.Connection], snap: pd.Data
                 _safe_val(r.get("updated_at")),
             )
         )
-    with conn.cursor() as cur:
-        if USE_POSTGRES:
-            psycopg2.extras.execute_batch(cur, upsert_sql, batch, page_size=500)
-            total = len(batch)
-        else:
+    if USE_POSTGRES:
+        BATCH_SIZE = 1000
+        for i in range(0, len(batch), BATCH_SIZE):
+            chunk = batch[i : i + BATCH_SIZE]
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(cur, upsert_sql, chunk, page_size=500)
+            conn.commit()
+            total += len(chunk)
+    else:
+        with conn.cursor() as cur:
             cur.executemany(upsert_sql, batch)
             total = len(batch)
-    conn.commit()
+        conn.commit()
 
     snapshot_date = _safe_val(snap.iloc[0]["snapshot_date"])
     with conn.cursor() as cur:
