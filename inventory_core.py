@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import sqlite3
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import pandas as pd
 import psycopg2
@@ -12,6 +13,11 @@ from psycopg2.extensions import connection as PGConnection
 
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DB_PATH = os.environ.get(
+    "DATABASE_PATH",
+    os.path.join(os.path.dirname(__file__), "inventory.db"),
+)
+USE_POSTGRES = bool(DATABASE_URL)
 
 
 @dataclass(frozen=True)
@@ -31,15 +37,75 @@ SELECT snapshot_date, sku, name, category, stock, channel_stock, warehouse_stock
        COALESCE(assort_box_count, 0) AS assort_box_count
 FROM snapshots WHERE snapshot_date = %s
 """
+if not USE_POSTGRES:
+    SNAPSHOT_SELECT_SQL = SNAPSHOT_SELECT_SQL.replace("%s", "?")
 
 
 def init_db() -> None:
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL 환경 변수가 설정되어 있지 않습니다.")
-    conn = psycopg2.connect(DATABASE_URL)
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+    else:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     try:
-        with conn.cursor() as cur:
-            cur.execute(
+        if USE_POSTGRES:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS snapshots (
+                        snapshot_date TEXT NOT NULL,
+                        sku TEXT NOT NULL,
+                        name TEXT,
+                        category TEXT,
+                        stock INTEGER NOT NULL DEFAULT 0,
+                        channel_stock INTEGER DEFAULT 0,
+                        warehouse_stock INTEGER DEFAULT 0,
+                        warehouse1_stock INTEGER DEFAULT 0,
+                        warehouse2_stock INTEGER DEFAULT 0,
+                        warehouse1_solid INTEGER DEFAULT 0,
+                        warehouse1_assort INTEGER DEFAULT 0,
+                        warehouse2_solid INTEGER DEFAULT 0,
+                        warehouse2_assort INTEGER DEFAULT 0,
+                        assort_ratio INTEGER DEFAULT 0,
+                        assort_box_count INTEGER DEFAULT 0,
+                        min_stock INTEGER DEFAULT 0,
+                        lead_time_days INTEGER DEFAULT 7,
+                        safety_stock INTEGER DEFAULT 0,
+                        sales_qty INTEGER DEFAULT 0,
+                        distribution_note TEXT,
+                        updated_at TEXT,
+                        PRIMARY KEY (snapshot_date, sku)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_snapshots_sku_date
+                    ON snapshots (sku, snapshot_date)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS omni_blocked (
+                        snapshot_date TEXT NOT NULL,
+                        style_code TEXT NOT NULL,
+                        sku_code TEXT NOT NULL,
+                        blocked_qty INTEGER NOT NULL,
+                        top_store TEXT,
+                        PRIMARY KEY (snapshot_date, style_code, sku_code)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                    """
+                )
+        else:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS snapshots (
                     snapshot_date TEXT NOT NULL,
@@ -67,13 +133,10 @@ def init_db() -> None:
                 )
                 """
             )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_snapshots_sku_date
-                ON snapshots (sku, snapshot_date)
-                """
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_snapshots_sku_date ON snapshots (sku, snapshot_date)"
             )
-            cur.execute(
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS omni_blocked (
                     snapshot_date TEXT NOT NULL,
@@ -85,7 +148,7 @@ def init_db() -> None:
                 )
                 """
             )
-            cur.execute(
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -98,11 +161,13 @@ def init_db() -> None:
         conn.close()
 
 
-def get_conn() -> PGConnection:
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL 환경 변수가 설정되어 있지 않습니다.")
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = False
+def get_conn() -> Union[PGConnection, sqlite3.Connection]:
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        return conn
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
 
@@ -398,19 +463,20 @@ def _row_to_upsert_tuple(r: dict) -> tuple:
     )
 
 
-def upsert_snapshot(conn: PGConnection, snap: pd.DataFrame) -> int:
+def upsert_snapshot(conn: Union[PGConnection, sqlite3.Connection], snap: pd.DataFrame) -> int:
     rows = snap.to_dict(orient="records")
     if not rows:
         return 0
 
     BATCH_SIZE = 1000
-    upsert_sql = """
+    ph = "%s" if USE_POSTGRES else "?"
+    upsert_sql = f"""
         INSERT INTO snapshots (
             snapshot_date, sku, name, category, stock, channel_stock, warehouse_stock,
             warehouse1_stock, warehouse2_stock,
             min_stock, lead_time_days, safety_stock, sales_qty, updated_at
         ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}
         )
         ON CONFLICT (snapshot_date, sku) DO UPDATE SET
             name = EXCLUDED.name,
@@ -438,10 +504,10 @@ def upsert_snapshot(conn: PGConnection, snap: pd.DataFrame) -> int:
     snapshot_date = rows[0].get("snapshot_date")
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             UPDATE snapshots
             SET warehouse_stock = COALESCE(warehouse1_stock, 0) + COALESCE(warehouse2_stock, 0)
-            WHERE snapshot_date = %s
+            WHERE snapshot_date = {ph}
             """,
             (snapshot_date,),
         )
@@ -450,7 +516,9 @@ def upsert_snapshot(conn: PGConnection, snap: pd.DataFrame) -> int:
     return total
 
 
-def update_channel_stock(conn: PGConnection, snapshot_date: str, sku_channel_map: dict) -> int:
+def update_channel_stock(
+    conn: Union[PGConnection, sqlite3.Connection], snapshot_date: str, sku_channel_map: dict
+) -> int:
     """매장재고 업데이트"""
     if not sku_channel_map:
         return 0
@@ -459,13 +527,27 @@ def update_channel_stock(conn: PGConnection, snapshot_date: str, sku_channel_map
         (channel_stock, now, snapshot_date, sku)
         for sku, channel_stock in sku_channel_map.items()
     ]
+    if not USE_POSTGRES:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                UPDATE snapshots
+                SET channel_stock = ?, updated_at = ?
+                WHERE snapshot_date = ? AND sku = ?
+                """,
+                rows,
+            )
+            n = cur.rowcount
+        conn.commit()
+        return n if n is not None and n >= 0 else len(rows)
+
     sql = """
         UPDATE snapshots AS s SET
             channel_stock = v.c::integer,
             updated_at = v.u
         FROM (VALUES %s) AS v(c, u, d, k)
         WHERE s.snapshot_date = v.d AND s.sku = v.k
-        """
+    """
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(
             cur,
@@ -479,7 +561,9 @@ def update_channel_stock(conn: PGConnection, snapshot_date: str, sku_channel_map
     return n if n is not None and n >= 0 else len(rows)
 
 
-def update_distribution_note(conn: PGConnection, snapshot_date: str, sku_note_map: dict) -> int:
+def update_distribution_note(
+    conn: Union[PGConnection, sqlite3.Connection], snapshot_date: str, sku_note_map: dict
+) -> int:
     """분배내역 업데이트 (SKU별 텍스트)"""
     if not sku_note_map:
         return 0
@@ -488,13 +572,27 @@ def update_distribution_note(conn: PGConnection, snapshot_date: str, sku_note_ma
         (note or "", now, snapshot_date, sku)
         for sku, note in sku_note_map.items()
     ]
+    if not USE_POSTGRES:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                UPDATE snapshots
+                SET distribution_note = ?, updated_at = ?
+                WHERE snapshot_date = ? AND sku = ?
+                """,
+                rows,
+            )
+            n = cur.rowcount
+        conn.commit()
+        return n if n is not None and n >= 0 else len(rows)
+
     sql = """
         UPDATE snapshots AS s SET
             distribution_note = v.n,
             updated_at = v.u
         FROM (VALUES %s) AS v(n, u, d, k)
         WHERE s.snapshot_date = v.d AND s.sku = v.k
-        """
+    """
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(
             cur,
@@ -509,7 +607,7 @@ def update_distribution_note(conn: PGConnection, snapshot_date: str, sku_note_ma
 
 
 def update_warehouse_stock(
-    conn: PGConnection,
+    conn: Union[PGConnection, sqlite3.Connection],
     snapshot_date: str,
     sku_warehouse_map: dict,
     warehouse_num: int = 0,
@@ -532,6 +630,7 @@ def update_warehouse_stock(
     arm = assort_ratio_map or {}
     abm = assort_box_map or {}
 
+    ph = "%s" if USE_POSTGRES else "?"
     if sku_warehouse_map:
         with conn.cursor() as cur:
             if warehouse_num == 1:
@@ -557,15 +656,15 @@ def update_warehouse_stock(
                             )
                         )
                     cur.executemany(
-                        """
+                        f"""
                         UPDATE snapshots
-                        SET warehouse1_stock = %s,
-                            warehouse1_solid = %s,
-                            warehouse1_assort = %s,
-                            assort_ratio = CASE WHEN %s > 0 THEN %s ELSE assort_ratio END,
-                            assort_box_count = CASE WHEN %s > 0 THEN %s ELSE assort_box_count END,
-                            updated_at = %s
-                        WHERE snapshot_date = %s AND sku = %s
+                        SET warehouse1_stock = {ph},
+                            warehouse1_solid = {ph},
+                            warehouse1_assort = {ph},
+                            assort_ratio = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_ratio END,
+                            assort_box_count = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_box_count END,
+                            updated_at = {ph}
+                        WHERE snapshot_date = {ph} AND sku = {ph}
                         """,
                         rows,
                     )
@@ -575,10 +674,10 @@ def update_warehouse_stock(
                         for sku, warehouse_stock in sku_warehouse_map.items()
                     ]
                     cur.executemany(
-                        """
+                        f"""
                         UPDATE snapshots
-                        SET warehouse1_stock = %s, updated_at = %s
-                        WHERE snapshot_date = %s AND sku = %s
+                        SET warehouse1_stock = {ph}, updated_at = {ph}
+                        WHERE snapshot_date = {ph} AND sku = {ph}
                         """,
                         rows,
                     )
@@ -606,15 +705,15 @@ def update_warehouse_stock(
                             )
                         )
                     cur.executemany(
-                        """
+                        f"""
                         UPDATE snapshots
-                        SET warehouse2_stock = %s,
-                            warehouse2_solid = %s,
-                            warehouse2_assort = %s,
-                            assort_ratio = CASE WHEN %s > 0 THEN %s ELSE assort_ratio END,
-                            assort_box_count = CASE WHEN %s > 0 THEN %s ELSE assort_box_count END,
-                            updated_at = %s
-                        WHERE snapshot_date = %s AND sku = %s
+                        SET warehouse2_stock = {ph},
+                            warehouse2_solid = {ph},
+                            warehouse2_assort = {ph},
+                            assort_ratio = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_ratio END,
+                            assort_box_count = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_box_count END,
+                            updated_at = {ph}
+                        WHERE snapshot_date = {ph} AND sku = {ph}
                         """,
                         rows,
                     )
@@ -624,10 +723,10 @@ def update_warehouse_stock(
                         for sku, warehouse_stock in sku_warehouse_map.items()
                     ]
                     cur.executemany(
-                        """
+                        f"""
                         UPDATE snapshots
-                        SET warehouse2_stock = %s, updated_at = %s
-                        WHERE snapshot_date = %s AND sku = %s
+                        SET warehouse2_stock = {ph}, updated_at = {ph}
+                        WHERE snapshot_date = {ph} AND sku = {ph}
                         """,
                         rows,
                     )
@@ -638,10 +737,10 @@ def update_warehouse_stock(
                     for sku, warehouse_stock in sku_warehouse_map.items()
                 ]
                 cur.executemany(
-                    """
+                    f"""
                     UPDATE snapshots
-                    SET warehouse_stock = %s, updated_at = %s
-                    WHERE snapshot_date = %s AND sku = %s
+                    SET warehouse_stock = {ph}, updated_at = {ph}
+                    WHERE snapshot_date = {ph} AND sku = {ph}
                     """,
                     rows,
                 )
@@ -650,10 +749,10 @@ def update_warehouse_stock(
 
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             UPDATE snapshots
             SET warehouse_stock = COALESCE(warehouse1_stock, 0) + COALESCE(warehouse2_stock, 0)
-            WHERE snapshot_date = %s
+            WHERE snapshot_date = {ph}
             """,
             (snapshot_date,),
         )
@@ -662,7 +761,7 @@ def update_warehouse_stock(
     return updated
 
 
-def load_latest(conn: PGConnection) -> tuple[Optional[str], pd.DataFrame]:
+def load_latest(conn: Union[PGConnection, sqlite3.Connection]) -> tuple[Optional[str], pd.DataFrame]:
     with conn.cursor() as cur:
         cur.execute("SELECT MAX(snapshot_date) FROM snapshots")
         row = cur.fetchone()
@@ -673,9 +772,12 @@ def load_latest(conn: PGConnection) -> tuple[Optional[str], pd.DataFrame]:
     return latest, df
 
 
-def load_history(conn: PGConnection, sku: str) -> pd.DataFrame:
+def load_history(conn: Union[PGConnection, sqlite3.Connection], sku: str) -> pd.DataFrame:
+    q = "SELECT snapshot_date, stock FROM snapshots WHERE sku = %s ORDER BY snapshot_date"
+    if not USE_POSTGRES:
+        q = q.replace("%s", "?")
     return pd.read_sql_query(
-        "SELECT snapshot_date, stock FROM snapshots WHERE sku = %s ORDER BY snapshot_date",
+        q,
         conn,
         params=(sku,),
     )
