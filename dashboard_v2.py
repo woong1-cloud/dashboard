@@ -7,9 +7,11 @@ from __future__ import annotations
 import datetime as dt
 import os
 import re
+import traceback
+from urllib.parse import urlencode
 from collections import defaultdict
 from functools import wraps
-from io import StringIO
+from io import BytesIO, StringIO
 from typing import Any, Callable, Optional
 
 import pandas as pd
@@ -47,8 +49,22 @@ from inventory_core import (
 cache = Cache()
 
 
+def _invalidate_snapshot_caches() -> None:
+    """스냅샷 데이터 변경 후 dashboard_base·item_summary_* 만 무효화 (전체 clear 지양)."""
+    cache.delete("dashboard_base")
+    _backend = getattr(cache.cache, "_cache", None)
+    if _backend is None:
+        cache.clear()
+        # TODO: item_summary 키만 삭제하도록 개선 필요
+        return
+    _keys = [k for k in _backend.keys() if str(k).startswith("item_summary_")]
+    if _keys:
+        cache.delete_many(*_keys)
+
+
 APP_TITLE = "재고 대시보드 V4"
 DEFAULT_PASSWORD = "1234"
+_pw_cache = {"value": None}
 
 # DB에 gsheet_url이 없을 때 업로드 폼·동기화에 쓰는 기본 스프레드시트
 DEFAULT_GSHEET_URL = (
@@ -307,6 +323,7 @@ def _set_password_in_db(new_password: str) -> None:
             (new_password,),
         )
         conn.commit()
+        _pw_cache["value"] = new_password
     except Exception as e:
         print(f"[ERROR] 비밀번호 저장 실패: {e}")
         raise
@@ -314,7 +331,10 @@ def _set_password_in_db(new_password: str) -> None:
 
 def _expected_password() -> str:
     """로그인에 사용할 현재 비밀번호 반환"""
-    return _get_password_from_db()
+    if _pw_cache["value"] is not None:
+        return _pw_cache["value"]
+    _pw_cache["value"] = _get_password_from_db()
+    return _pw_cache["value"]
 
 
 def login_required(view: Callable[..., Any]) -> Callable[..., Any]:
@@ -367,12 +387,474 @@ def backup_page():
     return render_template("backup.html", title=APP_TITLE)
 
 
+def _build_fillup_excel(df: pd.DataFrame, latest_date: str) -> BytesIO:
+    """필업지 엑셀(아소트 BOX + 솔리드 PCS) BytesIO 생성."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    NAVY = "1F3864"
+    HM_HDR = "2E75B6"
+    BP_HDR = "375623"
+    HM_DATA = "DEEAF1"
+    BP_DATA = "E2EFDA"
+    HM_ALT = "EBF3FA"
+    BP_ALT = "EAF4E7"
+    ID_HDR = "BDD7EE"
+    ID_FC = "1F3864"
+    AN_HDR = "595959"
+    INPUT = "FFFDE7"
+    ROW_ALT = "F5F5F5"
+
+    STATUS_ORDER = {
+        "긴급필업": 0,
+        "재고없음": 1,
+        "필업필요": 2,
+        "체크필요": 3,
+        "저재고": 4,
+        "필업검토": 5,
+        "정상": 6,
+    }
+    STATUS_STYLE = {
+        "긴급필업": ("FF0000", "FFE6E6"),
+        "재고없음": ("FFFFFF", "333333"),
+        "필업필요": ("C55A11", "FDEBD7"),
+        "체크필요": ("0070C0", "DEEBF7"),
+        "저재고": ("7F6000", "FFF2CC"),
+        "필업검토": ("595959", "F2F2F2"),
+        "정상": ("375623", "E2EFDA"),
+    }
+
+    thin = Side(style="thin", color="BBBBBB")
+    thick = Side(style="medium", color="555555")
+    NB = Border(left=thin, right=thin, top=thin, bottom=thin)
+    IB = Border(left=thick, right=thick, top=thick, bottom=thick)
+
+    def _c(ws, row, col, val="", bg="FFFFFF", fc="000000", bold=False, sz=9, align="center", wrap=False, border=NB):
+        cell = ws.cell(row=row, column=col, value=val)
+        cell.fill = PatternFill("solid", fgColor=bg)
+        cell.font = Font(bold=bold, size=sz, name="Arial", color=fc)
+        cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
+        cell.border = border
+        return cell
+
+    wb = Workbook()
+
+    # ── 시트1: 아소트 필업지 ─────────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "아소트 필업지 (BOX단위)"
+
+    df_a = df[(df["warehouse1_assort"] > 0) | (df["warehouse2_assort"] > 0)].copy()
+
+    assort_rows = []
+    for (style, color), grp in df_a.groupby(["style_code", "color_code"], sort=False):
+        pcs_per_box = int(grp["assort_ratio"].sum())
+        hm_assort_pcs = int(grp["warehouse1_assort"].sum())
+        bp_assort_pcs = int(grp["warehouse2_assort"].sum())
+        total_pcs = hm_assort_pcs + bp_assort_pcs
+
+        if pcs_per_box > 0:
+            hm_box = round(hm_assort_pcs / pcs_per_box, 1)
+            bp_box = round(bp_assort_pcs / pcs_per_box, 1)
+            unit = "BOX"
+        else:
+            hm_box = hm_assort_pcs
+            bp_box = bp_assort_pcs
+            unit = "PCS"
+
+        stock_sum = int(grp["stock"].sum())
+        online_sum = int(grp["online_stock"].sum())
+        channel_sum = int(grp["channel_stock"].sum())
+        daily_sum = round(float(grp["daily_sales_7d"].sum()), 1)
+        days_out = round((stock_sum + total_pcs) / daily_sum, 1) if daily_sum > 0 else 999.0
+        weeks_out = round(days_out / 7, 1) if days_out < 999 else "-"
+        suggested = int(grp["suggested_order_qty"].sum())
+        season = grp["season"].iloc[0]
+        name = str(grp["name"].iloc[0]) if "name" in grp.columns else ""
+
+        worst_status = min(grp["status"].tolist(), key=lambda s: STATUS_ORDER.get(s, 9))
+
+        assort_rows.append(
+            {
+                "style": style,
+                "color": color,
+                "name": name,
+                "daily": daily_sum,
+                "stock": stock_sum,
+                "online_stock": online_sum,
+                "channel_stock": channel_sum,
+                "season": season,
+                "status": worst_status,
+                "hm_box": hm_box,
+                "bp_box": bp_box,
+                "unit": unit,
+                "pcs_per_box": pcs_per_box if pcs_per_box > 0 else "-",
+                "total_pcs": total_pcs,
+                "days_out": days_out,
+                "weeks_out": weeks_out,
+                "suggested": suggested,
+            }
+        )
+
+    assort_rows.sort(key=lambda x: x["daily"], reverse=True)
+
+    ws1.merge_cells("A1:R1")
+    _c(
+        ws1,
+        1,
+        1,
+        f"📋 아소트 필업지  |  스타일+컬러 / BOX단위  |  기준일: {latest_date}",
+        NAVY,
+        "FFFFFF",
+        bold=True,
+        sz=12,
+        align="left",
+    )
+
+    sections = [
+        ("상품 정보", 1, 9, ID_HDR, ID_FC),
+        ("📦 항만 물류센터", 10, 12, HM_HDR, "FFFFFF"),
+        ("📦 부평 물류센터", 13, 15, BP_HDR, "FFFFFF"),
+        ("재고 분석", 16, 18, AN_HDR, "FFFFFF"),
+    ]
+    for label, s, e, bg, fc in sections:
+        ws1.merge_cells(start_row=2, start_column=s, end_row=2, end_column=e)
+        _c(ws1, 2, s, label, bg, fc, bold=True, sz=10, border=IB)
+        for ci in range(s + 1, e + 1):
+            ws1.cell(row=2, column=ci).fill = PatternFill("solid", fgColor=bg)
+            ws1.cell(row=2, column=ci).border = IB
+
+    hdrs1 = [
+        (1, "스타일코드", ID_HDR, ID_FC),
+        (2, "컬러코드", ID_HDR, ID_FC),
+        (3, "상품명", ID_HDR, ID_FC),
+        (4, "시즌", ID_HDR, ID_FC),
+        (5, "상태", ID_HDR, ID_FC),
+        (6, "일평균\n판매", ID_HDR, ID_FC),
+        (7, "현재재고", ID_HDR, ID_FC),
+        (8, "공홈재고\n(현재-매장)", ID_HDR, "0070C0"),
+        (9, "매장재고", ID_HDR, ID_FC),
+        (10, "가용\nBOX수", HM_HDR, "FFFFFF"),
+        (11, "PCS/BOX", HM_HDR, "FFFFFF"),
+        (12, "분배요청\n[BOX]", HM_HDR, "FFFFFF"),
+        (13, "가용\nBOX수", BP_HDR, "FFFFFF"),
+        (14, "PCS/BOX", BP_HDR, "FFFFFF"),
+        (15, "분배요청\n[BOX]", BP_HDR, "FFFFFF"),
+        (16, "아소트\n총PCS", AN_HDR, "FFFFFF"),
+        (17, "소진예상일", AN_HDR, "FFFFFF"),
+        (18, "필업제안\n수량", AN_HDR, "FFFFFF"),
+    ]
+    for ci, label, bg, fc in hdrs1:
+        _c(ws1, 3, ci, label, bg, fc, bold=True, sz=9, wrap=True)
+
+    for ri, r in enumerate(assort_rows, start=4):
+        even = ri % 2 == 0
+        bg_id = ROW_ALT if even else "FFFFFF"
+        bg_hm = HM_ALT if even else HM_DATA
+        bg_bp = BP_ALT if even else BP_DATA
+        sc = STATUS_STYLE.get(r["status"], ("000000", "FFFFFF"))
+
+        _c(ws1, ri, 1, r["style"], bg_id, align="left")
+        _c(ws1, ri, 2, r["color"], bg_id)
+        _c(ws1, ri, 3, r["name"], bg_id, align="left", wrap=True)
+        _c(ws1, ri, 4, r["season"], bg_id)
+
+        _c(ws1, ri, 5, r["status"], sc[1], sc[0], bold=True)
+
+        _c(ws1, ri, 6, r["daily"], bg_id, "0070C0", bold=True)
+        _c(ws1, ri, 7, r["stock"], bg_id, fc="FF0000" if r["stock"] == 0 else "000000", bold=(r["stock"] == 0))
+
+        _c(
+            ws1,
+            ri,
+            8,
+            r["online_stock"],
+            bg_id,
+            fc="FF0000" if r["online_stock"] == 0 else "0070C0",
+            bold=True,
+            border=IB,
+        )
+
+        _c(ws1, ri, 9, r["channel_stock"], bg_id, "666666")
+
+        _c(ws1, ri, 10, r["hm_box"], bg_hm, bold=True)
+        _c(ws1, ri, 11, r["pcs_per_box"], bg_hm, "555555")
+        _c(ws1, ri, 12, "", INPUT, border=IB)
+
+        _c(ws1, ri, 13, r["bp_box"], bg_bp, bold=True)
+        _c(ws1, ri, 14, r["pcs_per_box"], bg_bp, "555555")
+        _c(ws1, ri, 15, "", INPUT, border=IB)
+
+        _c(ws1, ri, 16, r["total_pcs"], bg_id)
+
+        d = r["days_out"]
+        d_fc = "FF0000" if d < 7 else ("C55A11" if d < 14 else "000000")
+        _c(ws1, ri, 17, "-" if d >= 999 else d, bg_id, d_fc, bold=(d < 14))
+
+        sq = r["suggested"]
+        _c(ws1, ri, 18, sq, "FFD7D7" if sq > 0 else bg_id, "C00000" if sq > 0 else "000000", bold=(sq > 0))
+
+        ws1.row_dimensions[ri].height = 16
+
+    col_w1 = [14, 7, 36, 6, 9, 9, 8, 12, 8, 10, 9, 13, 10, 9, 13, 10, 10, 11]
+    for i, w in enumerate(col_w1, 1):
+        ws1.column_dimensions[get_column_letter(i)].width = w
+
+    ws1.row_dimensions[1].height = 24
+    ws1.row_dimensions[2].height = 20
+    ws1.row_dimensions[3].height = 34
+    ws1.freeze_panes = "A4"
+
+    # ── 시트2: 솔리드 필업지 ─────────────────────────────────────
+    ws2 = wb.create_sheet("솔리드 필업지 (PCS단위)")
+
+    df_s = df[(df["warehouse1_solid"] > 0) | (df["warehouse2_solid"] > 0)].copy()
+
+    ws2.merge_cells("A1:P1")
+    _c(
+        ws2,
+        1,
+        1,
+        f"📋 솔리드 필업지  |  SKU / PCS단위  |  기준일: {latest_date}",
+        NAVY,
+        "FFFFFF",
+        bold=True,
+        sz=12,
+        align="left",
+    )
+
+    sections2 = [
+        ("상품 정보", 1, 9, ID_HDR, ID_FC),
+        ("📦 항만 물류센터", 10, 11, HM_HDR, "FFFFFF"),
+        ("📦 부평 물류센터", 12, 13, BP_HDR, "FFFFFF"),
+        ("재고 분석", 14, 16, AN_HDR, "FFFFFF"),
+    ]
+    for label, s, e, bg, fc in sections2:
+        ws2.merge_cells(start_row=2, start_column=s, end_row=2, end_column=e)
+        _c(ws2, 2, s, label, bg, fc, bold=True, sz=10, border=IB)
+        for ci in range(s + 1, e + 1):
+            ws2.cell(row=2, column=ci).fill = PatternFill("solid", fgColor=bg)
+            ws2.cell(row=2, column=ci).border = IB
+
+    hdrs2 = [
+        (1, "SKU", ID_HDR, ID_FC),
+        (2, "상품명", ID_HDR, ID_FC),
+        (3, "사이즈", ID_HDR, ID_FC),
+        (4, "시즌", ID_HDR, ID_FC),
+        (5, "상태", ID_HDR, ID_FC),
+        (6, "일평균\n판매", ID_HDR, ID_FC),
+        (7, "현재재고", ID_HDR, ID_FC),
+        (8, "공홈재고\n(현재-매장)", ID_HDR, "0070C0"),
+        (9, "매장재고", ID_HDR, ID_FC),
+        (10, "항만\n가용PCS", HM_HDR, "FFFFFF"),
+        (11, "분배요청\n[PCS]", HM_HDR, "FFFFFF"),
+        (12, "부평\n가용PCS", BP_HDR, "FFFFFF"),
+        (13, "분배요청\n[PCS]", BP_HDR, "FFFFFF"),
+        (14, "물류재고합", AN_HDR, "FFFFFF"),
+        (15, "소진예상일", AN_HDR, "FFFFFF"),
+        (16, "필업제안\n수량", AN_HDR, "FFFFFF"),
+    ]
+    for ci, label, bg, fc in hdrs2:
+        _c(ws2, 3, ci, label, bg, fc, bold=True, sz=9, wrap=True)
+
+    for ri, (_, srow) in enumerate(df_s.iterrows(), start=4):
+        even = ri % 2 == 0
+        bg_id = ROW_ALT if even else "FFFFFF"
+        bg_hm = HM_ALT if even else HM_DATA
+        bg_bp = BP_ALT if even else BP_DATA
+
+        sku = str(srow.get("sku", "") or "")
+        name = str(srow.get("name", "") or "")
+        size = str(srow.get("size_code", "") or "")
+        season = str(srow.get("season", "") or "")
+        status = str(srow.get("status", "정상") or "정상")
+        daily = float(srow.get("daily_sales_7d") or 0)
+        stock = int(srow.get("stock") or 0)
+        online = int(srow.get("online_stock") or 0)
+        channel = int(srow.get("channel_stock") or 0)
+        hm_s = int(srow.get("warehouse1_solid") or 0)
+        bp_s = int(srow.get("warehouse2_solid") or 0)
+        wh_tot = hm_s + bp_s
+        d = float(srow.get("days_until_out") or 999)
+        sq = int(srow.get("suggested_order_qty") or 0)
+
+        sc = STATUS_STYLE.get(status, ("000000", "FFFFFF"))
+
+        _c(ws2, ri, 1, sku, bg_id, align="left", sz=8)
+        _c(ws2, ri, 2, name, bg_id, align="left", wrap=True)
+        _c(ws2, ri, 3, size, bg_id)
+        _c(ws2, ri, 4, season, bg_id)
+        _c(ws2, ri, 5, status, sc[1], sc[0], bold=True)
+        _c(ws2, ri, 6, round(daily, 1), bg_id, "0070C0", bold=True)
+        _c(ws2, ri, 7, stock, bg_id, fc="FF0000" if stock == 0 else "000000", bold=(stock == 0))
+
+        _c(
+            ws2,
+            ri,
+            8,
+            online,
+            bg_id,
+            fc="FF0000" if online == 0 else "0070C0",
+            bold=True,
+            border=IB,
+        )
+
+        _c(ws2, ri, 9, channel, bg_id, "666666")
+        _c(ws2, ri, 10, hm_s, bg_hm, bold=True)
+        _c(ws2, ri, 11, "", INPUT, border=IB)
+        _c(ws2, ri, 12, bp_s, bg_bp, bold=True)
+        _c(ws2, ri, 13, "", INPUT, border=IB)
+        _c(ws2, ri, 14, wh_tot, bg_id)
+
+        d_fc = "FF0000" if d < 7 else ("C55A11" if d < 14 else "000000")
+        _c(ws2, ri, 15, "-" if d >= 999 else d, bg_id, d_fc, bold=(d < 14))
+        _c(ws2, ri, 16, sq, "FFD7D7" if sq > 0 else bg_id, "C00000" if sq > 0 else "000000", bold=(sq > 0))
+
+        ws2.row_dimensions[ri].height = 16
+
+    col_w2 = [18, 36, 7, 6, 9, 9, 8, 12, 8, 10, 13, 10, 13, 10, 10, 11]
+    for i, w in enumerate(col_w2, 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+
+    ws2.row_dimensions[1].height = 24
+    ws2.row_dimensions[2].height = 20
+    ws2.row_dimensions[3].height = 34
+    ws2.freeze_panes = "A4"
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+@app.get("/export/fillup")
+@login_required
+def export_fillup():
+    conn = get_conn()
+    try:
+        latest_date, latest = load_latest(conn)
+        if latest_date is None or latest.empty:
+            flash("출력할 데이터가 없습니다.", "warning")
+            return redirect(url_for("dashboard"))
+
+        wh = pd.read_sql_query(
+            """
+            SELECT sku,
+                   COALESCE(warehouse1_solid, 0) AS warehouse1_solid,
+                   COALESCE(warehouse1_assort, 0) AS warehouse1_assort,
+                   COALESCE(warehouse2_solid, 0) AS warehouse2_solid,
+                   COALESCE(warehouse2_assort, 0) AS warehouse2_assort
+            FROM snapshots WHERE snapshot_date = ?
+            """,
+            conn,
+            params=(latest_date,),
+        )
+        for c in ("warehouse1_solid", "warehouse1_assort", "warehouse2_solid", "warehouse2_assort"):
+            if c in latest.columns:
+                latest = latest.drop(columns=[c])
+        latest = latest.merge(wh, on="sku", how="left")
+
+        for col in (
+            "sales_qty",
+            "stock",
+            "channel_stock",
+            "warehouse_stock",
+            "warehouse1_stock",
+            "warehouse2_stock",
+            "warehouse1_solid",
+            "warehouse1_assort",
+            "warehouse2_solid",
+            "warehouse2_assort",
+            "assort_ratio",
+            "assort_box_count",
+        ):
+            if col not in latest.columns:
+                latest[col] = 0
+            latest[col] = pd.to_numeric(latest[col], errors="coerce").fillna(0).astype(int)
+
+        latest["daily_sales_7d"] = (latest["sales_qty"] / 7.0).round(2)
+        latest["total_available"] = latest["stock"] + latest["warehouse_stock"]
+        latest["days_until_out"] = (
+            latest["total_available"] / latest["daily_sales_7d"].replace(0, float("nan"))
+        ).round(1).fillna(999)
+        latest["suggested_order_qty"] = (
+            (latest["daily_sales_7d"] * 14) - latest["total_available"]
+        ).clip(lower=0).astype(int)
+
+        latest["online_stock"] = (latest["stock"] - latest["channel_stock"]).clip(lower=0).astype(int)
+
+        latest["style_code"] = latest["sku"].astype(str).str[:10]
+        latest["color_code"] = latest["sku"].astype(str).str[10:12]
+        latest["size_code"] = latest["sku"].astype(str).str[12:]
+        latest["season"] = latest["sku"].astype(str).str[4:6]
+
+        if "status" not in latest.columns:
+            import numpy as np
+
+            cond = [
+                (latest["stock"] == 0) & (latest["daily_sales_7d"] > 0),
+                (latest["stock"] == 0),
+                (latest["daily_sales_7d"] > 0) & (latest["days_until_out"] < 7),
+                (latest["stock"] <= 10) & (latest["daily_sales_7d"] > 0),
+                (latest["days_until_out"] < 14) & (latest["daily_sales_7d"] > 0),
+            ]
+            choices = ["긴급필업", "재고없음", "필업필요", "체크필요", "필업검토"]
+            latest["status"] = np.select(cond, choices, default="정상")
+
+        # 물류에 재고 있고 온라인(공홈) 부족·소진 임박 등 실무 필업 목적만 포함
+        cond_a = (
+            (latest["daily_sales_7d"] > 0)
+            & (latest["days_until_out"] < 14)
+            & (latest["warehouse_stock"] > 0)
+        )
+        cond_b = (
+            ((latest["stock"] <= 0) | (latest["online_stock"] <= 0))
+            & (latest["warehouse_stock"] > 0)
+            & (latest["daily_sales_7d"] > 0)
+        )
+        cond_c = (
+            (latest["warehouse_stock"] > 0)
+            & (latest["daily_sales_7d"] > 0)
+            & (latest["days_until_out"] < 60)
+        )
+        df_target = latest[cond_a | cond_b | cond_c].copy()
+
+        if "online_stock" not in df_target.columns:
+            df_target["online_stock"] = (
+                df_target["stock"] - df_target["channel_stock"]
+            ).clip(lower=0).astype(int)
+
+        df_target["_sort_days"] = df_target["days_until_out"].clip(upper=998)
+        df_target = df_target.sort_values(
+            ["_sort_days", "daily_sales_7d"],
+            ascending=[True, False],
+        ).drop(columns=["_sort_days"])
+
+        if df_target.empty:
+            flash("필업 대상 SKU가 없습니다.", "info")
+            return redirect(url_for("dashboard"))
+
+        output = _build_fillup_excel(df_target, str(latest_date))
+        return send_file(
+            output,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"필업지_{latest_date}.xlsx",
+        )
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        flash(f"필업지 생성 실패: {e}", "danger")
+        return redirect(url_for("dashboard"))
+    finally:
+        conn.close()
+
+
 @app.get("/export/current")
 @login_required
 def export_current():
     """현재 대시보드 데이터를 엑셀로 내보내기"""
-    from io import BytesIO
-    
     try:
         conn = get_conn()
         latest_date, latest = load_latest(conn)
@@ -548,7 +1030,7 @@ def gsheet_sync_post():
             session.pop("failed_count", None)
 
         sales_count = upsert_snapshot(conn, sales_snap)
-        cache.clear()
+        _invalidate_snapshot_caches()
         flash(
             f"✅ DB 최신화 완료: 구글 시트 → {sales_count}개 품목 반영 (기준일 {date})",
             "success",
@@ -624,6 +1106,7 @@ def upload_post():
         flash("날짜 형식이 올바르지 않습니다(YYYY-MM-DD).", "danger")
         return redirect(url_for("upload_get"))
 
+    conn = None
     try:
         conn = get_conn()
 
@@ -665,7 +1148,8 @@ def upload_post():
             sales_snap = result
         
         sales_count = upsert_snapshot(conn, sales_snap)
-        
+        conn.commit()
+
         # 2. 물류센터1 재고 업로드 (선택사항)
         warehouse1_count = 0
         if warehouse_file and warehouse_file.filename:
@@ -674,34 +1158,66 @@ def upload_post():
             
             if warehouse_ext in [".xlsx", ".xls", ".xlsb"]:
                 warehouse_df = pd.read_excel(warehouse_file, sheet_name=(warehouse_sheet or 0))
+                warehouse_df.columns = [str(c).strip() for c in warehouse_df.columns]
                 print(f"[INFO] 물류센터1 엑셀 컬럼: {warehouse_df.columns.tolist()}")
                 print(f"[INFO] 물류센터1 엑셀 행 수: {len(warehouse_df)}")
-                
-                warehouse_snap = normalize_excel(warehouse_df, snapshot_date=date)
-                print(f"[INFO] 정규화 후 행 수: {len(warehouse_snap)}")
-                
-                if warehouse_snap.empty:
-                    flash("⚠️ 물류센터1 파일에서 유효한 데이터를 찾을 수 없습니다.", "warning")
+
+                if warehouse_df.empty:
+                    flash("⚠️ 항만 물류센터 파일에서 유효한 데이터를 찾을 수 없습니다.", "warning")
                 else:
-                    # SKU와 물류재고 매핑
                     sku_warehouse_map = {}
-                    for _, row in warehouse_snap.iterrows():
-                        sku = str(row["sku"]).strip()
-                        warehouse = int(row.get("warehouse_stock") or 0)
-                        if sku and len(sku) == 15:
-                            sku_warehouse_map[sku] = warehouse
-                    
+                    sku_solid_map = {}
+                    sku_assort_map = {}
+                    sku_ratio_map = {}
+                    sku_box_map = {}
+
+                    def _wh_int(val, default=0) -> int:
+                        try:
+                            if val is None or (isinstance(val, float) and pd.isna(val)):
+                                return default
+                            return int(float(val))
+                        except (TypeError, ValueError):
+                            return default
+
+                    for _, row in warehouse_df.iterrows():
+                        sku = str(row.get("상품", "") or "").strip()
+                        if not sku or len(sku) != 15:
+                            continue
+
+                        solid = _wh_int(row.get("솔리드가용재고", 0))
+                        assort_raw = row.get("아소트 가용재고", row.get("아소트가용재고", 0))
+                        assort = _wh_int(assort_raw)
+                        ratio = _wh_int(row.get("아소트비율", 0))
+                        box_count = _wh_int(row.get("아소트박스수", 0))
+
+                        total = solid + assort
+                        sku_warehouse_map[sku] = total
+                        sku_solid_map[sku] = solid
+                        sku_assort_map[sku] = assort
+                        if ratio > 0:
+                            sku_ratio_map[sku] = ratio
+                        if box_count > 0:
+                            sku_box_map[sku] = box_count
+
                     if sku_warehouse_map:
                         warehouse1_count = update_warehouse_stock(
-                            conn, date.isoformat(), sku_warehouse_map, warehouse_num=1
+                            conn,
+                            date.isoformat(),
+                            sku_warehouse_map,
+                            warehouse_num=1,
+                            solid_map=sku_solid_map if sku_solid_map else None,
+                            assort_map=sku_assort_map if sku_assort_map else None,
+                            assort_ratio_map=sku_ratio_map if sku_ratio_map else None,
+                            assort_box_map=sku_box_map if sku_box_map else None,
                         )
+                        conn.commit()
                         total_warehouse = sum(sku_warehouse_map.values())
                         print(f"[INFO] 물류센터1 업로드: {len(sku_warehouse_map)}개 SKU, 총 재고: {total_warehouse}")
                         print(f"[INFO] 업데이트된 SKU: {warehouse1_count}개")
                     else:
-                        flash("⚠️ 물류센터1 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
+                        flash("⚠️ 항만 물류센터 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
             else:
-                flash("물류센터1: Excel 파일만 지원됩니다.", "warning")
+                flash("항만 물류센터: Excel 파일만 지원됩니다.", "warning")
         
         # 3. 물류센터2 재고 업로드 (선택사항)
         warehouse2_count = 0
@@ -711,34 +1227,66 @@ def upload_post():
             
             if warehouse2_ext in [".xlsx", ".xls", ".xlsb"]:
                 warehouse2_df = pd.read_excel(warehouse_file2, sheet_name=(warehouse2_sheet or 0))
+                warehouse2_df.columns = [str(c).strip() for c in warehouse2_df.columns]
                 print(f"[INFO] 물류센터2 엑셀 컬럼: {warehouse2_df.columns.tolist()}")
                 print(f"[INFO] 물류센터2 엑셀 행 수: {len(warehouse2_df)}")
-                
-                warehouse2_snap = normalize_excel(warehouse2_df, snapshot_date=date)
-                print(f"[INFO] 정규화 후 행 수: {len(warehouse2_snap)}")
-                
-                if warehouse2_snap.empty:
-                    flash("⚠️ 물류센터2 파일에서 유효한 데이터를 찾을 수 없습니다.", "warning")
+
+                if warehouse2_df.empty:
+                    flash("⚠️ 부평 물류센터 파일에서 유효한 데이터를 찾을 수 없습니다.", "warning")
                 else:
-                    # SKU와 물류재고 매핑
                     sku_warehouse2_map = {}
-                    for _, row in warehouse2_snap.iterrows():
-                        sku = str(row["sku"]).strip()
-                        warehouse = int(row.get("warehouse_stock") or 0)
-                        if sku and len(sku) == 15:
-                            sku_warehouse2_map[sku] = warehouse
-                    
+                    sku2_solid_map = {}
+                    sku2_assort_map = {}
+                    sku2_ratio_map = {}
+                    sku2_box_map = {}
+
+                    def _wh2_int(val, default=0) -> int:
+                        try:
+                            if val is None or (isinstance(val, float) and pd.isna(val)):
+                                return default
+                            return int(float(val))
+                        except (TypeError, ValueError):
+                            return default
+
+                    for _, row in warehouse2_df.iterrows():
+                        sku = str(row.get("상품", "") or "").strip()
+                        if not sku or len(sku) != 15:
+                            continue
+
+                        solid = _wh2_int(row.get("솔리드가용재고", 0))
+                        assort_raw = row.get("아소트 가용재고", row.get("아소트가용재고", 0))
+                        assort = _wh2_int(assort_raw)
+                        ratio = _wh2_int(row.get("아소트비율", 0))
+                        box_count = _wh2_int(row.get("아소트박스수", 0))
+
+                        total = solid + assort
+                        sku_warehouse2_map[sku] = total
+                        sku2_solid_map[sku] = solid
+                        sku2_assort_map[sku] = assort
+                        if ratio > 0:
+                            sku2_ratio_map[sku] = ratio
+                        if box_count > 0:
+                            sku2_box_map[sku] = box_count
+
                     if sku_warehouse2_map:
                         warehouse2_count = update_warehouse_stock(
-                            conn, date.isoformat(), sku_warehouse2_map, warehouse_num=2
+                            conn,
+                            date.isoformat(),
+                            sku_warehouse2_map,
+                            warehouse_num=2,
+                            solid_map=sku2_solid_map if sku2_solid_map else None,
+                            assort_map=sku2_assort_map if sku2_assort_map else None,
+                            assort_ratio_map=sku2_ratio_map if sku2_ratio_map else None,
+                            assort_box_map=sku2_box_map if sku2_box_map else None,
                         )
+                        conn.commit()
                         total_warehouse2 = sum(sku_warehouse2_map.values())
                         print(f"[INFO] 물류센터2 업로드: {len(sku_warehouse2_map)}개 SKU, 총 재고: {total_warehouse2}")
                         print(f"[INFO] 업데이트된 SKU: {warehouse2_count}개")
                     else:
-                        flash("⚠️ 물류센터2 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
+                        flash("⚠️ 부평 물류센터 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
             else:
-                flash("물류센터2: Excel 파일만 지원됩니다.", "warning")
+                flash("부평 물류센터: Excel 파일만 지원됩니다.", "warning")
         
         # 4. 매장 재고 업로드 (선택사항)
         channel_count = 0
@@ -769,6 +1317,7 @@ def upload_post():
                         channel_count = update_channel_stock(
                             conn, date.isoformat(), sku_channel_map
                         )
+                        conn.commit()
                         total_channel = sum(sku_channel_map.values())
                         print(f"[INFO] 매장재고 업로드: {len(sku_channel_map)}개 SKU, 총 재고: {total_channel}")
                         print(f"[INFO] 업데이트된 SKU: {channel_count}개")
@@ -836,6 +1385,7 @@ def upload_post():
                             distribution_count = update_distribution_note(
                                 conn, date.isoformat(), sku_note_map
                             )
+                            conn.commit()
                             print(f"[INFO] 분배내역 업로드: {distribution_count}개 SKU 반영 (분배량 기준)" if use_qty else f"[INFO] 분배내역 업로드: {distribution_count}개 SKU 반영")
                     else:
                         flash("⚠️ 분배내역 파일에 SKU(또는 상품코드) 컬럼과 분배량(또는 N열/수량) 컬럼이 필요합니다.", "warning")
@@ -956,9 +1506,9 @@ def upload_post():
         total_warehouse_count = warehouse1_count + warehouse2_count
         msg_parts = [f"상품분석판매: {sales_count}개 품목"]
         if warehouse1_count > 0:
-            msg_parts.append(f"물류센터1: {warehouse1_count}개 SKU")
+            msg_parts.append(f"항만 물류센터: {warehouse1_count}개 SKU")
         if warehouse2_count > 0:
-            msg_parts.append(f"물류센터2: {warehouse2_count}개 SKU")
+            msg_parts.append(f"부평 물류센터: {warehouse2_count}개 SKU")
         if channel_count > 0:
             msg_parts.append(f"매장재고: {channel_count}개 SKU")
         if distribution_count > 0:
@@ -968,19 +1518,21 @@ def upload_post():
         
         success_msg = f"✅ {', '.join(msg_parts)} 업로드 완료 (날짜: {date})"
         flash(success_msg, "success")
-        cache.clear()
+        _invalidate_snapshot_caches()
 
         # 실패한 행이 있으면 알림 (다운로드는 상단 배너에서 가능)
         if 'failed_count' in session and session['failed_count'] > 0:
             flash(f"⚠️ {session['failed_count']}개 행이 업로드 실패했습니다. 상단 배너에서 실패 목록을 다운로드하세요.", "warning")
         
         return redirect(url_for("dashboard"))
-        
+
     except Exception as e:
         flash(f"업로드 실패: {e}", "danger")
-        import traceback
         traceback.print_exc()
         return redirect(url_for("upload_get"))
+    finally:
+        if conn:
+            conn.close()
 
 
 def _status_badge(status: str) -> str:
@@ -1001,7 +1553,7 @@ def _status_badge(status: str) -> str:
 @login_required
 @cache.cached(timeout=300, query_string=True, key_prefix="dashboard")
 def dashboard():
-    # [최적화] GET+쿼리스트링별 300초 캐시; 동기화/업로드/초기화 시 cache.clear()
+    # [최적화] GET+쿼리스트링별 300초 캐시; 동기화/업로드/초기화 시 _invalidate_snapshot_caches()
     """대시보드 메인 화면"""
     try:
         return _dashboard_impl()
@@ -1098,6 +1650,11 @@ def _build_item_inventory_summary(
     정렬: 총 판매량 내림차순.
     Returns: (rows, prev_date or None, has_prev)
     """
+    cache_key = f"item_summary_{latest_date}_{item_tab}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     dates_df = pd.read_sql_query(
         """
         SELECT DISTINCT snapshot_date AS d
@@ -1271,6 +1828,7 @@ def _build_item_inventory_summary(
                 "item_imminent_top20": item_imminent_top20_map.get(str(r["item_code"]), []),
             }
         )
+    cache.set(cache_key, (rows, prev_date, has_prev), timeout=300)
     return rows, prev_date, has_prev
 
 
@@ -1576,8 +2134,10 @@ def _dashboard_impl():
     urgent_category = (request.args.get("urgent_category") or "(전체)").strip()
     target_cover_days = int((request.args.get("target_cover_days") or "14").strip() or 14)
     sku_pick: Optional[str] = (request.args.get("sku") or "").strip() or None
+    page = max(1, int(request.args.get("page", 1) or 1))
 
-    working = base["all_data"].copy()
+    working = base["all_data"]
+    working = working.copy()
     working["suggested_order_qty"] = (
         (working["daily_sales_7d"] * target_cover_days) - working["total_available"]
     ).clip(lower=0).astype(int)
@@ -1609,7 +2169,7 @@ def _dashboard_impl():
     omni_summary = base["omni_summary"]
     omni_table = base["omni_table"]
 
-    view = working.copy()
+    view = working
     if q:
         or_groups = [g.strip() for g in q.split(",") if g.strip()]
         vq = view.copy()
@@ -1668,11 +2228,25 @@ def _dashboard_impl():
         "lead_time_days", "safety_stock",
     ]
 
-    table = (
-        view[table_columns]
-        .sort_values("daily_sales_7d", ascending=False)
-        .to_dict(orient="records")
-    )
+    PAGE_SIZE = 300
+    sorted_view = view[table_columns].sort_values("daily_sales_7d", ascending=False)
+    total_count = len(sorted_view)
+    total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    table = sorted_view.iloc[(page - 1) * PAGE_SIZE : page * PAGE_SIZE].to_dict(orient="records")
+
+    def _dash_pagination_url(target_page: int) -> str:
+        pairs: list[tuple[str, str]] = []
+        for key in request.args:
+            if key == "page":
+                continue
+            for val in request.args.getlist(key):
+                pairs.append((key, val))
+        pairs.append(("page", str(target_page)))
+        return f"{url_for('dashboard')}?{urlencode(pairs, doseq=True)}"
+
+    pagination_prev_url = _dash_pagination_url(page - 1) if page > 1 else ""
+    pagination_next_url = _dash_pagination_url(page + 1) if page < total_pages else ""
 
     item_tab_req = (request.args.get("item_tab") or "all").strip().upper()
     if item_tab_req != "ALL" and item_tab_req not in {str(c).upper() for c in curr_year_codes}:
@@ -1760,6 +2334,11 @@ def _dashboard_impl():
         item_prev_date=item_prev_date,
         item_has_prev=item_has_prev,
         item_tab_season_codes=curr_year_codes,
+        page=page,
+        total_pages=total_pages,
+        total_count=total_count,
+        pagination_prev_url=pagination_prev_url,
+        pagination_next_url=pagination_next_url,
     )
 
 
@@ -1809,7 +2388,7 @@ def clear_data():
             conn = get_conn()
             conn.execute("DELETE FROM snapshots")
             conn.commit()
-            cache.clear()
+            _invalidate_snapshot_caches()
             flash("✅ 모든 데이터가 삭제되었습니다.", "success")
             return redirect(url_for("dashboard"))
         except Exception as e:

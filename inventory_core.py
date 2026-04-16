@@ -24,7 +24,9 @@ CFG = CoreConfig()
 SNAPSHOT_SELECT_SQL = """
 SELECT snapshot_date, sku, name, category, stock, channel_stock, warehouse_stock,
        warehouse1_stock, warehouse2_stock, min_stock, lead_time_days, safety_stock,
-       sales_qty, updated_at, distribution_note
+       sales_qty, updated_at, distribution_note,
+       COALESCE(assort_ratio, 0) AS assort_ratio,
+       COALESCE(assort_box_count, 0) AS assort_box_count
 FROM snapshots WHERE snapshot_date = ?
 """
 
@@ -46,6 +48,12 @@ def init_db(db_path: str = DB_PATH) -> None:
                 warehouse_stock INTEGER,
                 warehouse1_stock INTEGER,
                 warehouse2_stock INTEGER,
+                warehouse1_solid INTEGER DEFAULT 0,
+                warehouse1_assort INTEGER DEFAULT 0,
+                warehouse2_solid INTEGER DEFAULT 0,
+                warehouse2_assort INTEGER DEFAULT 0,
+                assort_ratio INTEGER DEFAULT 0,
+                assort_box_count INTEGER DEFAULT 0,
                 min_stock INTEGER,
                 lead_time_days INTEGER,
                 safety_stock INTEGER,
@@ -82,6 +90,25 @@ def init_db(db_path: str = DB_PATH) -> None:
                 conn.commit()
         except Exception:
             pass
+
+        for col in (
+            "warehouse1_solid",
+            "warehouse1_assort",
+            "warehouse2_solid",
+            "warehouse2_assort",
+        ):
+            try:
+                conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col} INTEGER DEFAULT 0")
+            except Exception:
+                pass
+        conn.commit()
+
+        for col in ("assort_ratio", "assort_box_count"):
+            try:
+                conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col} INTEGER DEFAULT 0")
+            except Exception:
+                pass
+        conn.commit()
 
         conn.execute(
             """
@@ -390,7 +417,7 @@ def upsert_snapshot(conn: sqlite3.Connection, snap: pd.DataFrame) -> int:
     )
     conn.commit()
     
-    # 모든 스냅샷에 대해 warehouse_stock 재계산 (센터1 + 센터2)
+    # 모든 스냅샷에 대해 warehouse_stock 재계산 (항만 + 부평)
     if rows:
         snapshot_date = rows[0].get("snapshot_date")
         conn.execute(
@@ -452,40 +479,129 @@ def update_distribution_note(conn: sqlite3.Connection, snapshot_date: str, sku_n
     return conn.total_changes - n0
 
 
-def update_warehouse_stock(conn: sqlite3.Connection, snapshot_date: str, sku_warehouse_map: dict, warehouse_num: int = 0) -> int:
+def update_warehouse_stock(
+    conn: sqlite3.Connection,
+    snapshot_date: str,
+    sku_warehouse_map: dict,
+    warehouse_num: int = 0,
+    solid_map: Optional[dict] = None,
+    assort_map: Optional[dict] = None,
+    assort_ratio_map: Optional[dict] = None,
+    assort_box_map: Optional[dict] = None,
+) -> int:
     # [최적화] executemany 후 합계 UPDATE; 배치 반영 건수는 total_changes 차이로 집계
-    """물류재고 업데이트 (warehouse_num: 0=전체, 1=센터1, 2=센터2)"""
+    """물류재고 업데이트 (warehouse_num: 0=전체, 1=항만, 2=부평)"""
     updated = 0
     now = dt.datetime.now().isoformat(timespec="seconds")
+    use_detail_maps = (
+        solid_map is not None
+        or assort_map is not None
+        or assort_ratio_map is not None
+        or assort_box_map is not None
+    )
+    sm = solid_map or {}
+    am = assort_map or {}
+    arm = assort_ratio_map or {}
+    abm = assort_box_map or {}
 
     if sku_warehouse_map:
         n0 = conn.total_changes
         if warehouse_num == 1:
-            rows = [
-                (warehouse_stock, now, snapshot_date, sku)
-                for sku, warehouse_stock in sku_warehouse_map.items()
-            ]
-            conn.executemany(
-                """
-                UPDATE snapshots
-                SET warehouse1_stock = ?, updated_at = ?
-                WHERE snapshot_date = ? AND sku = ?
-                """,
-                rows,
-            )
+            if use_detail_maps:
+                rows = []
+                for sku, warehouse_stock in sku_warehouse_map.items():
+                    w_solid = int(sm.get(sku, 0) or 0)
+                    w_assort = int(am.get(sku, 0) or 0)
+                    ratio = int(arm.get(sku, 0) or 0)
+                    box_ct = int(abm.get(sku, 0) or 0)
+                    rows.append(
+                        (
+                            warehouse_stock,
+                            w_solid,
+                            w_assort,
+                            ratio,
+                            ratio,
+                            box_ct,
+                            box_ct,
+                            now,
+                            snapshot_date,
+                            sku,
+                        )
+                    )
+                conn.executemany(
+                    """
+                    UPDATE snapshots
+                    SET warehouse1_stock = ?,
+                        warehouse1_solid = ?,
+                        warehouse1_assort = ?,
+                        assort_ratio = CASE WHEN ? > 0 THEN ? ELSE assort_ratio END,
+                        assort_box_count = CASE WHEN ? > 0 THEN ? ELSE assort_box_count END,
+                        updated_at = ?
+                    WHERE snapshot_date = ? AND sku = ?
+                    """,
+                    rows,
+                )
+            else:
+                rows = [
+                    (warehouse_stock, now, snapshot_date, sku)
+                    for sku, warehouse_stock in sku_warehouse_map.items()
+                ]
+                conn.executemany(
+                    """
+                    UPDATE snapshots
+                    SET warehouse1_stock = ?, updated_at = ?
+                    WHERE snapshot_date = ? AND sku = ?
+                    """,
+                    rows,
+                )
         elif warehouse_num == 2:
-            rows = [
-                (warehouse_stock, now, snapshot_date, sku)
-                for sku, warehouse_stock in sku_warehouse_map.items()
-            ]
-            conn.executemany(
-                """
-                UPDATE snapshots
-                SET warehouse2_stock = ?, updated_at = ?
-                WHERE snapshot_date = ? AND sku = ?
-                """,
-                rows,
-            )
+            if use_detail_maps:
+                rows = []
+                for sku, warehouse_stock in sku_warehouse_map.items():
+                    w_solid = int(sm.get(sku, 0) or 0)
+                    w_assort = int(am.get(sku, 0) or 0)
+                    ratio = int(arm.get(sku, 0) or 0)
+                    box_ct = int(abm.get(sku, 0) or 0)
+                    rows.append(
+                        (
+                            warehouse_stock,
+                            w_solid,
+                            w_assort,
+                            ratio,
+                            ratio,
+                            box_ct,
+                            box_ct,
+                            now,
+                            snapshot_date,
+                            sku,
+                        )
+                    )
+                conn.executemany(
+                    """
+                    UPDATE snapshots
+                    SET warehouse2_stock = ?,
+                        warehouse2_solid = ?,
+                        warehouse2_assort = ?,
+                        assort_ratio = CASE WHEN ? > 0 THEN ? ELSE assort_ratio END,
+                        assort_box_count = CASE WHEN ? > 0 THEN ? ELSE assort_box_count END,
+                        updated_at = ?
+                    WHERE snapshot_date = ? AND sku = ?
+                    """,
+                    rows,
+                )
+            else:
+                rows = [
+                    (warehouse_stock, now, snapshot_date, sku)
+                    for sku, warehouse_stock in sku_warehouse_map.items()
+                ]
+                conn.executemany(
+                    """
+                    UPDATE snapshots
+                    SET warehouse2_stock = ?, updated_at = ?
+                    WHERE snapshot_date = ? AND sku = ?
+                    """,
+                    rows,
+                )
         else:
             rows = [
                 (warehouse_stock, now, snapshot_date, sku)

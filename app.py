@@ -108,12 +108,12 @@ def run_upload():
             key="sales",
         )
         warehouse_file = st.file_uploader(
-            "물류센터1 재고 (선택) - Excel",
+            "항만 물류센터 재고 (선택) - Excel",
             type=["xlsx", "xls", "xlsb"],
             key="wh1",
         )
         warehouse_file2 = st.file_uploader(
-            "물류센터2 재고 (선택) - Excel",
+            "부평 물류센터 재고 (선택) - Excel",
             type=["xlsx", "xls", "xlsb"],
             key="wh2",
         )
@@ -166,7 +166,7 @@ def run_upload():
 
         msg_parts = [f"상품분석판매: {sales_count}개 품목"]
 
-        # 2. 물류센터1
+        # 2. 항만 물류센터
         if warehouse_file and warehouse_file.name:
             wh1_df = pd.read_excel(warehouse_file, sheet_name=0)
             wh1_snap = normalize_excel(wh1_df, snapshot_date=date)
@@ -180,9 +180,9 @@ def run_upload():
                     c = update_warehouse_stock(
                         conn, date.isoformat(), sku_map, warehouse_num=1
                     )
-                    msg_parts.append(f"물류센터1: {c}개 SKU")
+                    msg_parts.append(f"항만 물류센터: {c}개 SKU")
 
-        # 3. 물류센터2
+        # 3. 부평 물류센터
         if warehouse_file2 and warehouse_file2.name:
             wh2_df = pd.read_excel(warehouse_file2, sheet_name=0)
             wh2_snap = normalize_excel(wh2_df, snapshot_date=date)
@@ -196,7 +196,7 @@ def run_upload():
                     c = update_warehouse_stock(
                         conn, date.isoformat(), sku_map, warehouse_num=2
                     )
-                    msg_parts.append(f"물류센터2: {c}개 SKU")
+                    msg_parts.append(f"부평 물류센터: {c}개 SKU")
 
         # 4. 매장재고
         if channel_file and channel_file.name:

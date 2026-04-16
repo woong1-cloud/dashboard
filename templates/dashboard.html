@@ -49,6 +49,12 @@
                 <small class="d-block text-muted">모든 히스토리 포함</small>
               </a>
             </li>
+            <li><hr class="dropdown-divider"></li>
+            <li>
+              <a class="dropdown-item" href="{{ url_for('export_fillup') }}">
+                <i class="bi bi-clipboard-check me-1"></i> 필업지 출력 (아소트+솔리드)
+              </a>
+            </li>
           </ul>
         </div>
         <a class="btn btn-primary" href="{{ url_for('upload_get') }}">
@@ -439,8 +445,8 @@
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">일평균판매</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">현재재고</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem; background-color: #e0f2fe; color: #075985; font-weight: 600;">매장<br>재고</th>
-                <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">센터1</th>
-                <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">센터2</th>
+                <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">항만</th>
+                <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">부평</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">물류재고</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">소진일</th>
                 <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">필업 제안</th>
@@ -562,8 +568,8 @@
               <label class="form-label small fw-semibold mb-1"><i class="bi bi-truck"></i> 물류센터</label>
               <select class="form-select form-select-sm" name="warehouse_center">
                 <option value="전체" {% if selected.warehouse_center == "전체" %}selected{% endif %}>전체</option>
-                <option value="센터1" {% if selected.warehouse_center == "센터1" %}selected{% endif %}>센터1</option>
-                <option value="센터2" {% if selected.warehouse_center == "센터2" %}selected{% endif %}>센터2</option>
+                <option value="센터1" {% if selected.warehouse_center == "센터1" %}selected{% endif %}>항만</option>
+                <option value="센터2" {% if selected.warehouse_center == "센터2" %}selected{% endif %}>부평</option>
               </select>
             </div>
             <div class="col-auto">
@@ -670,7 +676,7 @@
         <div class="card shadow-sm border-0">
           <div class="card-body">
             <div class="d-flex align-items-center justify-content-between mb-2">
-              <h3 class="fw-semibold mb-0" style="font-size: 0.95rem; color: #000;">재고 현황 (판매량 높은 순)</h3>
+              <h3 id="inventory-table" class="fw-semibold mb-0" style="font-size: 0.95rem; color: #000;">재고 현황 (판매량 높은 순)</h3>
               <span class="small" style="color: #6b7280; font-size: 0.75rem;">판매량 기반 분석</span>
             </div>
             <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
@@ -684,8 +690,8 @@
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">일평균<br>판매</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">현재<br>재고</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem; background-color: #e0f2fe; color: #075985; font-weight: 600;">매장<br>재고</th>
-                    <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">센터1</th>
-                    <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">센터2</th>
+                    <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">항만</th>
+                    <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">부평</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">물류재고<br>(합계)</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">소진<br>예상일</th>
                     <th class="text-end sortable" style="padding: 0.4rem 0.5rem;">필업<br>제안</th>
@@ -728,8 +734,26 @@
                 </tbody>
               </table>
             </div>
+            <nav class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3 pt-2 border-top" style="border-color: rgba(148,163,184,.35) !important;" aria-label="재고 현황 페이지">
+              <div class="small" style="color: #64748b;">
+                전체 <span class="fw-semibold text-dark">{{ "{:,}".format(total_count) }}</span>건
+                · 페이지 <span class="fw-semibold text-dark">{{ page }}</span> / <span class="fw-semibold text-dark">{{ total_pages }}</span>
+              </div>
+              <div class="btn-group btn-group-sm" role="group" aria-label="페이지 이동">
+                {% if page > 1 %}
+                <a class="btn btn-outline-primary" href="{{ pagination_prev_url }}#inventory-table"><i class="bi bi-chevron-left"></i> 이전</a>
+                {% else %}
+                <button type="button" class="btn btn-outline-secondary" disabled><i class="bi bi-chevron-left"></i> 이전</button>
+                {% endif %}
+                {% if page < total_pages %}
+                <a class="btn btn-outline-primary" href="{{ pagination_next_url }}#inventory-table">다음 <i class="bi bi-chevron-right"></i></a>
+                {% else %}
+                <button type="button" class="btn btn-outline-secondary" disabled>다음 <i class="bi bi-chevron-right"></i></button>
+                {% endif %}
+              </div>
+            </nav>
             <div class="small mt-2" style="color: #94a3b8;">
-              ※ 물류재고 = 센터1 + 센터2 (각 센터: 솔리드+아소트). 소진 예상일은 현재 재고 + 물류 재고 기준입니다.<br>
+              ※ 물류재고 = 항만 + 부평 (각 물류센터: 솔리드+아소트). 소진 예상일은 현재 재고 + 물류 재고 기준입니다.<br>
               ※ <span style="color: #f59e0b; font-weight: 600;">분배 가능</span> = 물류재고와 필업제안 중 작은 값 (실제 물류에서 분배받을 수 있는 최대 수량)
             </div>
           </div>
@@ -1249,4 +1273,19 @@
       });
     }
   </script>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  if (window.location.hash === "#inventory-table") {
+    const el = document.getElementById("inventory-table");
+    if (el) {
+      setTimeout(function () {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 80);
+    }
+  }
+});
+</script>
 {% endblock %}
