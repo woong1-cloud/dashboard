@@ -7,6 +7,7 @@ flask-caching
 requests
 plotly
 gunicorn
+gevent>=23.9.1
 streamlit>=1.23.0
 # Altair 5+는 vegalite.v4 경로 제거로 Streamlit 구버전과 충돌 → 4.x 고정
 altair<5

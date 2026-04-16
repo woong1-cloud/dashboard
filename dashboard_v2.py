@@ -33,6 +33,7 @@ from flask_caching import Cache
 
 from inventory_core import (
     DATABASE_URL,
+    USE_POSTGRES,
     _get_engine,
     avg_daily_usage_from_history,
     compute_daily_change,
@@ -50,6 +51,25 @@ from inventory_core import (
 
 # [최적화] 뷰 단에서 Cache 인스턴스에 데코레이터 연결
 cache = Cache()
+
+
+def _run_upsert_background(conn_params, sales_snap, date, cache_obj):
+    """백그라운드에서 DB 저장 실행"""
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(conn_params)
+        conn.set_client_encoding("UTF8")
+        from inventory_core import upsert_snapshot
+
+        upsert_snapshot(conn, sales_snap)
+        conn.commit()
+        conn.close()
+        cache_obj.clear()
+        print(f"[INFO] 백그라운드 upsert 완료: {len(sales_snap)}행, 기준일={date}")
+    except Exception as e:
+        print(f"[ERROR] 백그라운드 upsert 실패: {e}")
+        traceback.print_exc()
 
 
 def _invalidate_snapshot_caches() -> None:
@@ -1054,12 +1074,25 @@ def gsheet_sync_post():
                 session.pop("failed_csv_path", None)
                 session.pop("failed_count", None)
 
-            sales_count = upsert_snapshot(conn, sales_snap)
-            _invalidate_snapshot_caches()
-            flash(
-                f"✅ DB 최신화 완료: 구글 시트 → {sales_count}개 품목 반영 (기준일 {date})",
-                "success",
-            )
+            if USE_POSTGRES:
+                thread = threading.Thread(
+                    target=_run_upsert_background,
+                    args=(DATABASE_URL, sales_snap, date, cache),
+                    daemon=True,
+                )
+                thread.start()
+                sales_count = len(sales_snap)
+                flash(
+                    f"✅ {sales_count}개 품목 업로드 시작됨 (처리 중, 1~2분 후 반영)",
+                    "success",
+                )
+            else:
+                sales_count = upsert_snapshot(conn, sales_snap)
+                _invalidate_snapshot_caches()
+                flash(
+                    f"✅ DB 최신화 완료: 구글 시트 → {sales_count}개 품목 반영 (기준일 {date})",
+                    "success",
+                )
             if session.get("failed_count"):
                 flash(
                     f"⚠️ {session['failed_count']}개 행은 반영되지 않았습니다. 실패 목록을 다운로드하세요.",
@@ -1177,8 +1210,22 @@ def upload_post():
         else:
             sales_snap = result
         
-        sales_count = upsert_snapshot(conn, sales_snap)
-        conn.commit()
+        if USE_POSTGRES:
+            thread = threading.Thread(
+                target=_run_upsert_background,
+                args=(DATABASE_URL, sales_snap, date, cache),
+                daemon=True,
+            )
+            thread.start()
+            sales_count = len(sales_snap)
+            flash(
+                f"✅ {sales_count}개 품목 업로드 시작됨 (처리 중, 1~2분 후 반영)",
+                "success",
+            )
+            return redirect(url_for("dashboard"))
+        else:
+            sales_count = upsert_snapshot(conn, sales_snap)
+            conn.commit()
 
         # 2. 물류센터1(항만) 재고 업로드 (선택사항) — 물류 전용 컬럼 직접 파싱 (normalize_excel 경유 금지)
         warehouse1_count = 0
