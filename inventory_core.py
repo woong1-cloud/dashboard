@@ -47,31 +47,30 @@ if not USE_POSTGRES:
     SNAPSHOT_SELECT_SQL = SNAPSHOT_SELECT_SQL.replace("%s", "?")
 
 
-def _to_python(val):
-    """numpy/pandas 타입 -> Python 기본 타입 변환"""
-    if val is None:
+def _safe_val(v):
+    """모든 값을 psycopg2 안전 타입으로 변환"""
+    if v is None:
         return None
     try:
-        import numpy as np
-
-        if isinstance(val, (np.integer,)):
-            return int(val)
-        if isinstance(val, (np.floating,)):
-            return None if math.isnan(float(val)) else float(val)
-        if isinstance(val, np.bool_):
-            return bool(val)
-    except ImportError:
-        pass
-    try:
-        if pd.isna(val):
+        if pd.isna(v):
             return None
     except (TypeError, ValueError):
         pass
-    if isinstance(val, float) and math.isnan(val):
-        return None
-    if isinstance(val, (bytes, bytearray)):
-        return val.decode("utf-8", errors="replace")
-    return val
+    type_name = type(v).__name__
+    if "int" in type_name.lower():
+        return int(v)
+    if "float" in type_name.lower():
+        f = float(v)
+        return None if math.isnan(f) or math.isinf(f) else f
+    if "bool" in type_name.lower():
+        return bool(v)
+    if "timestamp" in type_name.lower() or "datetime" in type_name.lower():
+        return str(v)[:10]
+    if "date" in type_name.lower():
+        return str(v)
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="replace")
+    return str(v) if not isinstance(v, (str, int, float, bool)) else v
 
 
 def init_db() -> None:
@@ -502,7 +501,6 @@ def upsert_snapshot(conn: Union[PGConnection, sqlite3.Connection], snap: pd.Data
     if snap.empty:
         return 0
 
-    BATCH_SIZE = 1000
     ph = "%s" if USE_POSTGRES else "?"
     upsert_sql = f"""
         INSERT INTO snapshots (
@@ -527,34 +525,37 @@ def upsert_snapshot(conn: Union[PGConnection, sqlite3.Connection], snap: pd.Data
             updated_at = EXCLUDED.updated_at
         """
     total = 0
-    tuples = []
-    for row in snap.itertuples(index=False):
-        tuples.append(
+    records = snap.to_dict("records")
+    batch = []
+    for r in records:
+        batch.append(
             (
-                _to_python(row.snapshot_date),
-                _to_python(row.sku),
-                _to_python(row.name),
-                _to_python(row.category),
-                _to_python(row.stock),
-                _to_python(row.channel_stock),
-                _to_python(row.warehouse_stock),
-                _to_python(row.warehouse1_stock),
-                _to_python(row.warehouse2_stock),
-                _to_python(row.min_stock),
-                _to_python(row.lead_time_days),
-                _to_python(row.safety_stock),
-                _to_python(row.sales_qty),
-                _to_python(row.updated_at),
+                _safe_val(r.get("snapshot_date")),
+                _safe_val(r.get("sku")),
+                _safe_val(r.get("name")),
+                _safe_val(r.get("category")),
+                _safe_val(r.get("stock")) or 0,
+                _safe_val(r.get("channel_stock")) or 0,
+                _safe_val(r.get("warehouse_stock")) or 0,
+                _safe_val(r.get("warehouse1_stock")) or 0,
+                _safe_val(r.get("warehouse2_stock")) or 0,
+                _safe_val(r.get("min_stock")) or 0,
+                _safe_val(r.get("lead_time_days")) or 7,
+                _safe_val(r.get("safety_stock")) or 0,
+                _safe_val(r.get("sales_qty")) or 0,
+                _safe_val(r.get("updated_at")),
             )
         )
     with conn.cursor() as cur:
-        for i in range(0, len(tuples), BATCH_SIZE):
-            batch = tuples[i : i + BATCH_SIZE]
+        if USE_POSTGRES:
+            psycopg2.extras.execute_batch(cur, upsert_sql, batch, page_size=500)
+            total = len(batch)
+        else:
             cur.executemany(upsert_sql, batch)
-            total += len(batch)
+            total = len(batch)
     conn.commit()
 
-    snapshot_date = _to_python(snap.iloc[0]["snapshot_date"])
+    snapshot_date = _safe_val(snap.iloc[0]["snapshot_date"])
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -578,15 +579,26 @@ def update_channel_stock(
     now = dt.datetime.now().isoformat(timespec="seconds")
     rows = [
         (
-            _to_python(channel_stock),
-            _to_python(now),
-            _to_python(snapshot_date),
-            _to_python(sku),
+            _safe_val(channel_stock) or 0,
+            _safe_val(now),
+            _safe_val(snapshot_date),
+            _safe_val(sku),
         )
         for sku, channel_stock in sku_channel_map.items()
     ]
-    if not USE_POSTGRES:
-        with conn.cursor() as cur:
+    with conn.cursor() as cur:
+        if USE_POSTGRES:
+            psycopg2.extras.execute_batch(
+                cur,
+                """
+                UPDATE snapshots
+                SET channel_stock = %s, updated_at = %s
+                WHERE snapshot_date = %s AND sku = %s
+                """,
+                rows,
+                page_size=500,
+            )
+        else:
             cur.executemany(
                 """
                 UPDATE snapshots
@@ -595,25 +607,6 @@ def update_channel_stock(
                 """,
                 rows,
             )
-            n = cur.rowcount
-        conn.commit()
-        return n if n is not None and n >= 0 else len(rows)
-
-    sql = """
-        UPDATE snapshots AS s SET
-            channel_stock = v.c::integer,
-            updated_at = v.u
-        FROM (VALUES %s) AS v(c, u, d, k)
-        WHERE s.snapshot_date = v.d AND s.sku = v.k
-    """
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(
-            cur,
-            sql,
-            rows,
-            template="(%s, %s, %s, %s)",
-            page_size=1000,
-        )
         n = cur.rowcount
     conn.commit()
     return n if n is not None and n >= 0 else len(rows)
@@ -628,15 +621,26 @@ def update_distribution_note(
     now = dt.datetime.now().isoformat(timespec="seconds")
     rows = [
         (
-            _to_python(note or ""),
-            _to_python(now),
-            _to_python(snapshot_date),
-            _to_python(sku),
+            _safe_val(note or ""),
+            _safe_val(now),
+            _safe_val(snapshot_date),
+            _safe_val(sku),
         )
         for sku, note in sku_note_map.items()
     ]
-    if not USE_POSTGRES:
-        with conn.cursor() as cur:
+    with conn.cursor() as cur:
+        if USE_POSTGRES:
+            psycopg2.extras.execute_batch(
+                cur,
+                """
+                UPDATE snapshots
+                SET distribution_note = %s, updated_at = %s
+                WHERE snapshot_date = %s AND sku = %s
+                """,
+                rows,
+                page_size=500,
+            )
+        else:
             cur.executemany(
                 """
                 UPDATE snapshots
@@ -645,25 +649,6 @@ def update_distribution_note(
                 """,
                 rows,
             )
-            n = cur.rowcount
-        conn.commit()
-        return n if n is not None and n >= 0 else len(rows)
-
-    sql = """
-        UPDATE snapshots AS s SET
-            distribution_note = v.n,
-            updated_at = v.u
-        FROM (VALUES %s) AS v(n, u, d, k)
-        WHERE s.snapshot_date = v.d AND s.sku = v.k
-    """
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(
-            cur,
-            sql,
-            rows,
-            template="(%s, %s, %s, %s)",
-            page_size=1000,
-        )
         n = cur.rowcount
     conn.commit()
     return n if n is not None and n >= 0 else len(rows)
@@ -706,20 +691,19 @@ def update_warehouse_stock(
                         box_ct = int(abm.get(sku, 0) or 0)
                         rows.append(
                             (
-                                _to_python(warehouse_stock),
-                                _to_python(w_solid),
-                                _to_python(w_assort),
-                                _to_python(ratio),
-                                _to_python(ratio),
-                                _to_python(box_ct),
-                                _to_python(box_ct),
-                                _to_python(now),
-                                _to_python(snapshot_date),
-                                _to_python(sku),
+                                _safe_val(warehouse_stock) or 0,
+                                _safe_val(w_solid) or 0,
+                                _safe_val(w_assort) or 0,
+                                _safe_val(ratio) or 0,
+                                _safe_val(ratio) or 0,
+                                _safe_val(box_ct) or 0,
+                                _safe_val(box_ct) or 0,
+                                _safe_val(now),
+                                _safe_val(snapshot_date),
+                                _safe_val(sku),
                             )
                         )
-                    cur.executemany(
-                        f"""
+                    sql = f"""
                         UPDATE snapshots
                         SET warehouse1_stock = {ph},
                             warehouse1_solid = {ph},
@@ -728,27 +712,30 @@ def update_warehouse_stock(
                             assort_box_count = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_box_count END,
                             updated_at = {ph}
                         WHERE snapshot_date = {ph} AND sku = {ph}
-                        """,
-                        rows,
-                    )
+                        """
+                    if USE_POSTGRES:
+                        psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                    else:
+                        cur.executemany(sql, rows)
                 else:
                     rows = [
                         (
-                            _to_python(warehouse_stock),
-                            _to_python(now),
-                            _to_python(snapshot_date),
-                            _to_python(sku),
+                            _safe_val(warehouse_stock) or 0,
+                            _safe_val(now),
+                            _safe_val(snapshot_date),
+                            _safe_val(sku),
                         )
                         for sku, warehouse_stock in sku_warehouse_map.items()
                     ]
-                    cur.executemany(
-                        f"""
+                    sql = f"""
                         UPDATE snapshots
                         SET warehouse1_stock = {ph}, updated_at = {ph}
                         WHERE snapshot_date = {ph} AND sku = {ph}
-                        """,
-                        rows,
-                    )
+                        """
+                    if USE_POSTGRES:
+                        psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                    else:
+                        cur.executemany(sql, rows)
                 updated = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
             elif warehouse_num == 2:
                 if use_detail_maps:
@@ -760,20 +747,19 @@ def update_warehouse_stock(
                         box_ct = int(abm.get(sku, 0) or 0)
                         rows.append(
                             (
-                                _to_python(warehouse_stock),
-                                _to_python(w_solid),
-                                _to_python(w_assort),
-                                _to_python(ratio),
-                                _to_python(ratio),
-                                _to_python(box_ct),
-                                _to_python(box_ct),
-                                _to_python(now),
-                                _to_python(snapshot_date),
-                                _to_python(sku),
+                                _safe_val(warehouse_stock) or 0,
+                                _safe_val(w_solid) or 0,
+                                _safe_val(w_assort) or 0,
+                                _safe_val(ratio) or 0,
+                                _safe_val(ratio) or 0,
+                                _safe_val(box_ct) or 0,
+                                _safe_val(box_ct) or 0,
+                                _safe_val(now),
+                                _safe_val(snapshot_date),
+                                _safe_val(sku),
                             )
                         )
-                    cur.executemany(
-                        f"""
+                    sql = f"""
                         UPDATE snapshots
                         SET warehouse2_stock = {ph},
                             warehouse2_solid = {ph},
@@ -782,46 +768,50 @@ def update_warehouse_stock(
                             assort_box_count = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_box_count END,
                             updated_at = {ph}
                         WHERE snapshot_date = {ph} AND sku = {ph}
-                        """,
-                        rows,
-                    )
+                        """
+                    if USE_POSTGRES:
+                        psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                    else:
+                        cur.executemany(sql, rows)
                 else:
                     rows = [
                         (
-                            _to_python(warehouse_stock),
-                            _to_python(now),
-                            _to_python(snapshot_date),
-                            _to_python(sku),
+                            _safe_val(warehouse_stock) or 0,
+                            _safe_val(now),
+                            _safe_val(snapshot_date),
+                            _safe_val(sku),
                         )
                         for sku, warehouse_stock in sku_warehouse_map.items()
                     ]
-                    cur.executemany(
-                        f"""
+                    sql = f"""
                         UPDATE snapshots
                         SET warehouse2_stock = {ph}, updated_at = {ph}
                         WHERE snapshot_date = {ph} AND sku = {ph}
-                        """,
-                        rows,
-                    )
+                        """
+                    if USE_POSTGRES:
+                        psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                    else:
+                        cur.executemany(sql, rows)
                 updated = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
             else:
                 rows = [
                     (
-                        _to_python(warehouse_stock),
-                        _to_python(now),
-                        _to_python(snapshot_date),
-                        _to_python(sku),
+                        _safe_val(warehouse_stock) or 0,
+                        _safe_val(now),
+                        _safe_val(snapshot_date),
+                        _safe_val(sku),
                     )
                     for sku, warehouse_stock in sku_warehouse_map.items()
                 ]
-                cur.executemany(
-                    f"""
+                sql = f"""
                     UPDATE snapshots
                     SET warehouse_stock = {ph}, updated_at = {ph}
                     WHERE snapshot_date = {ph} AND sku = {ph}
-                    """,
-                    rows,
-                )
+                    """
+                if USE_POSTGRES:
+                    psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                else:
+                    cur.executemany(sql, rows)
                 updated = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
         conn.commit()
 
