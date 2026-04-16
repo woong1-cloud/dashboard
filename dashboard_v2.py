@@ -178,7 +178,7 @@ def create_app() -> Flask:
     app.config["PROPAGATE_EXCEPTIONS"] = True
     app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB 제한
     app.config["CACHE_TYPE"] = "SimpleCache"
-    app.config["CACHE_DEFAULT_TIMEOUT"] = 300
+    app.config["CACHE_DEFAULT_TIMEOUT"] = 60
     app.config["PERMANENT_SESSION_LIFETIME"] = dt.timedelta(days=30)
     cache.init_app(app)
     init_db()
@@ -1137,6 +1137,7 @@ def upload_post():
         return redirect(url_for("upload_get"))
 
     conn = None
+    upload_success = False
     try:
         conn = get_conn()
 
@@ -1558,12 +1559,12 @@ def upload_post():
         
         success_msg = f"✅ {', '.join(msg_parts)} 업로드 완료 (날짜: {date})"
         flash(success_msg, "success")
-        _invalidate_snapshot_caches()
 
         # 실패한 행이 있으면 알림 (다운로드는 상단 배너에서 가능)
         if 'failed_count' in session and session['failed_count'] > 0:
             flash(f"⚠️ {session['failed_count']}개 행이 업로드 실패했습니다. 상단 배너에서 실패 목록을 다운로드하세요.", "warning")
-        
+
+        upload_success = True
         return redirect(url_for("dashboard"))
 
     except Exception as e:
@@ -1571,6 +1572,8 @@ def upload_post():
         traceback.print_exc()
         return redirect(url_for("upload_get"))
     finally:
+        if upload_success:
+            cache.clear()
         if conn:
             conn.close()
 
@@ -1591,9 +1594,9 @@ def _status_badge(status: str) -> str:
 
 @app.get("/dashboard")
 @login_required
-@cache.cached(timeout=300, query_string=True, key_prefix="dashboard")
+@cache.cached(timeout=60, query_string=True, key_prefix="dashboard")
 def dashboard():
-    # [최적화] GET+쿼리스트링별 300초 캐시; 동기화/업로드/초기화 시 _invalidate_snapshot_caches()
+    # [최적화] GET+쿼리스트링별 60초 캐시; 동기화/업로드/초기화 시 _invalidate_snapshot_caches()
     """대시보드 메인 화면"""
     try:
         return _dashboard_impl()
@@ -1868,7 +1871,7 @@ def _build_item_inventory_summary(
                 "item_imminent_top20": item_imminent_top20_map.get(str(r["item_code"]), []),
             }
         )
-    cache.set(cache_key, (rows, prev_date, has_prev), timeout=300)
+    cache.set(cache_key, (rows, prev_date, has_prev), timeout=60)
     return rows, prev_date, has_prev
 
 
@@ -2148,7 +2151,7 @@ def _load_base_data() -> dict:
             "omni_summary": omni_summary,
             "omni_table": omni_table,
         }
-        cache.set("dashboard_base", out, timeout=300)
+        cache.set("dashboard_base", out, timeout=60)
         return out
     finally:
         conn.close()
