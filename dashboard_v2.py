@@ -53,23 +53,54 @@ from inventory_core import (
 cache = Cache()
 
 
-def _run_upsert_background(conn_params, sales_snap, date, cache_obj):
-    """백그라운드에서 DB 저장 실행"""
+def _run_upload_background(tasks: list[dict[str, Any]], cache_obj: Cache) -> None:
+    """백그라운드에서 업로드 DB 저장 작업을 순차 처리."""
+    conn = None
     try:
-        import psycopg2
+        conn = get_conn()
+        for task in tasks:
+            t = task.get("type")
+            if t == "upsert":
+                upsert_snapshot(conn, task["df"])
+            elif t == "warehouse1":
+                update_warehouse_stock(
+                    conn,
+                    task["date"],
+                    task["sku_map"],
+                    warehouse_num=1,
+                    solid_map=task.get("solid_map"),
+                    assort_map=task.get("assort_map"),
+                    assort_ratio_map=task.get("ratio_map"),
+                    assort_box_map=task.get("box_map"),
+                )
+            elif t == "warehouse2":
+                update_warehouse_stock(
+                    conn,
+                    task["date"],
+                    task["sku_map"],
+                    warehouse_num=2,
+                    solid_map=task.get("solid_map"),
+                    assort_map=task.get("assort_map"),
+                    assort_ratio_map=task.get("ratio_map"),
+                    assort_box_map=task.get("box_map"),
+                )
+            elif t == "channel":
+                update_channel_stock(conn, task["date"], task["sku_map"])
+            elif t == "distribution":
+                update_distribution_note(conn, task["date"], task["sku_map"])
+            else:
+                print(f"[WARN] 알 수 없는 백그라운드 작업 타입: {t}")
+                continue
+            conn.commit()
 
-        conn = psycopg2.connect(conn_params)
-        conn.set_client_encoding("UTF8")
-        from inventory_core import upsert_snapshot
-
-        upsert_snapshot(conn, sales_snap)
-        conn.commit()
-        conn.close()
         cache_obj.clear()
-        print(f"[INFO] 백그라운드 upsert 완료: {len(sales_snap)}행, 기준일={date}")
+        print(f"[INFO] 백그라운드 업로드 완료: {len(tasks)}개 작업")
     except Exception as e:
-        print(f"[ERROR] 백그라운드 upsert 실패: {e}")
+        print(f"[ERROR] 백그라운드 업로드 실패: {e}")
         traceback.print_exc()
+    finally:
+        if conn:
+            conn.close()
 
 
 def _invalidate_snapshot_caches() -> None:
@@ -1076,8 +1107,8 @@ def gsheet_sync_post():
 
             if USE_POSTGRES:
                 thread = threading.Thread(
-                    target=_run_upsert_background,
-                    args=(DATABASE_URL, sales_snap, date, cache),
+                    target=_run_upload_background,
+                    args=([{"type": "upsert", "df": sales_snap}], cache),
                     daemon=True,
                 )
                 thread.start()
@@ -1178,8 +1209,10 @@ def upload_post():
 
     conn = None
     upload_success = False
+    cache_cleared_in_background = False
     try:
         conn = get_conn()
+        tasks: list[dict[str, Any]] = []
 
         # 1. 상품분석판매 로드 (파일 업로드 또는 구글 시트)
         sales_count = 0
@@ -1224,17 +1257,8 @@ def upload_post():
                 sales_snap = result
 
             if USE_POSTGRES:
-                thread = threading.Thread(
-                    target=_run_upsert_background,
-                    args=(DATABASE_URL, sales_snap, date, cache),
-                    daemon=True,
-                )
-                thread.start()
                 sales_count = len(sales_snap)
-                flash(
-                    f"✅ {sales_count}개 품목 업로드 시작됨 (처리 중, 1~2분 후 반영)",
-                    "success",
-                )
+                tasks.append({"type": "upsert", "df": sales_snap})
             else:
                 sales_count = upsert_snapshot(conn, sales_snap)
                 conn.commit()
@@ -1289,17 +1313,31 @@ def upload_post():
                         sku_box_map[sku] = box_count
 
                 if sku_warehouse_map:
-                    warehouse1_count = update_warehouse_stock(
-                        conn,
-                        date.isoformat(),
-                        sku_warehouse_map,
-                        warehouse_num=1,
-                        solid_map=sku_solid_map if sku_solid_map else None,
-                        assort_map=sku_assort_map if sku_assort_map else None,
-                        assort_ratio_map=sku_ratio_map if sku_ratio_map else None,
-                        assort_box_map=sku_box_map if sku_box_map else None,
-                    )
-                    conn.commit()
+                    if USE_POSTGRES:
+                        warehouse1_count = len(sku_warehouse_map)
+                        tasks.append(
+                            {
+                                "type": "warehouse1",
+                                "date": date.isoformat(),
+                                "sku_map": sku_warehouse_map,
+                                "solid_map": sku_solid_map if sku_solid_map else None,
+                                "assort_map": sku_assort_map if sku_assort_map else None,
+                                "ratio_map": sku_ratio_map if sku_ratio_map else None,
+                                "box_map": sku_box_map if sku_box_map else None,
+                            }
+                        )
+                    else:
+                        warehouse1_count = update_warehouse_stock(
+                            conn,
+                            date.isoformat(),
+                            sku_warehouse_map,
+                            warehouse_num=1,
+                            solid_map=sku_solid_map if sku_solid_map else None,
+                            assort_map=sku_assort_map if sku_assort_map else None,
+                            assort_ratio_map=sku_ratio_map if sku_ratio_map else None,
+                            assort_box_map=sku_box_map if sku_box_map else None,
+                        )
+                        conn.commit()
                     total_wh = sum(sku_warehouse_map.values())
                     total_solid_sum = sum(sku_solid_map.values())
                     total_assort_sum = sum(sku_assort_map.values())
@@ -1363,17 +1401,31 @@ def upload_post():
                         sku_box2_map[sku] = box_count
 
                 if sku_warehouse2_map:
-                    warehouse2_count = update_warehouse_stock(
-                        conn,
-                        date.isoformat(),
-                        sku_warehouse2_map,
-                        warehouse_num=2,
-                        solid_map=sku_solid2_map if sku_solid2_map else None,
-                        assort_map=sku_assort2_map if sku_assort2_map else None,
-                        assort_ratio_map=sku_ratio2_map if sku_ratio2_map else None,
-                        assort_box_map=sku_box2_map if sku_box2_map else None,
-                    )
-                    conn.commit()
+                    if USE_POSTGRES:
+                        warehouse2_count = len(sku_warehouse2_map)
+                        tasks.append(
+                            {
+                                "type": "warehouse2",
+                                "date": date.isoformat(),
+                                "sku_map": sku_warehouse2_map,
+                                "solid_map": sku_solid2_map if sku_solid2_map else None,
+                                "assort_map": sku_assort2_map if sku_assort2_map else None,
+                                "ratio_map": sku_ratio2_map if sku_ratio2_map else None,
+                                "box_map": sku_box2_map if sku_box2_map else None,
+                            }
+                        )
+                    else:
+                        warehouse2_count = update_warehouse_stock(
+                            conn,
+                            date.isoformat(),
+                            sku_warehouse2_map,
+                            warehouse_num=2,
+                            solid_map=sku_solid2_map if sku_solid2_map else None,
+                            assort_map=sku_assort2_map if sku_assort2_map else None,
+                            assort_ratio_map=sku_ratio2_map if sku_ratio2_map else None,
+                            assort_box_map=sku_box2_map if sku_box2_map else None,
+                        )
+                        conn.commit()
                     total_wh2 = sum(sku_warehouse2_map.values())
                     total_solid2_sum = sum(sku_solid2_map.values())
                     total_assort2_sum = sum(sku_assort2_map.values())
@@ -1413,10 +1465,20 @@ def upload_post():
                             sku_channel_map[sku] = channel_stock
                     
                     if sku_channel_map:
-                        channel_count = update_channel_stock(
-                            conn, date.isoformat(), sku_channel_map
-                        )
-                        conn.commit()
+                        if USE_POSTGRES:
+                            channel_count = len(sku_channel_map)
+                            tasks.append(
+                                {
+                                    "type": "channel",
+                                    "date": date.isoformat(),
+                                    "sku_map": sku_channel_map,
+                                }
+                            )
+                        else:
+                            channel_count = update_channel_stock(
+                                conn, date.isoformat(), sku_channel_map
+                            )
+                            conn.commit()
                         total_channel = sum(sku_channel_map.values())
                         print(f"[INFO] 매장재고 업로드: {len(sku_channel_map)}개 SKU, 총 재고: {total_channel}")
                         print(f"[INFO] 업데이트된 SKU: {channel_count}개")
@@ -1481,10 +1543,20 @@ def upload_post():
                         if use_qty:
                             sku_note_map = {k: str(v) for k, v in sku_note_map.items()}
                         if sku_note_map:
-                            distribution_count = update_distribution_note(
-                                conn, date.isoformat(), sku_note_map
-                            )
-                            conn.commit()
+                            if USE_POSTGRES:
+                                distribution_count = len(sku_note_map)
+                                tasks.append(
+                                    {
+                                        "type": "distribution",
+                                        "date": date.isoformat(),
+                                        "sku_map": sku_note_map,
+                                    }
+                                )
+                            else:
+                                distribution_count = update_distribution_note(
+                                    conn, date.isoformat(), sku_note_map
+                                )
+                                conn.commit()
                             print(f"[INFO] 분배내역 업로드: {distribution_count}개 SKU 반영 (분배량 기준)" if use_qty else f"[INFO] 분배내역 업로드: {distribution_count}개 SKU 반영")
                     else:
                         flash("⚠️ 분배내역 파일에 SKU(또는 상품코드) 컬럼과 분배량(또는 N열/수량) 컬럼이 필요합니다.", "warning")
@@ -1602,6 +1674,25 @@ def upload_post():
             else:
                 flash("옴니판매불가: Excel 파일만 지원됩니다.", "warning")
         
+        if USE_POSTGRES and tasks:
+            thread = threading.Thread(
+                target=_run_upload_background,
+                args=(tasks, cache),
+                daemon=True,
+            )
+            thread.start()
+            cache_cleared_in_background = True
+            flash("✅ 업로드 시작됨 (1~2분 후 대시보드에 반영됩니다)", "success")
+
+            if "failed_count" in session and session["failed_count"] > 0:
+                flash(
+                    f"⚠️ {session['failed_count']}개 행이 업로드 실패했습니다. 상단 배너에서 실패 목록을 다운로드하세요.",
+                    "warning",
+                )
+
+            upload_success = True
+            return redirect(url_for("dashboard"))
+
         # 결과 메시지
         total_warehouse_count = warehouse1_count + warehouse2_count
         msg_parts = []
@@ -1635,7 +1726,7 @@ def upload_post():
         traceback.print_exc()
         return redirect(url_for("upload_get"))
     finally:
-        if upload_success:
+        if upload_success and not cache_cleared_in_background:
             cache.clear()
         if conn:
             conn.close()
