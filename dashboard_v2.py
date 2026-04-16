@@ -1172,141 +1172,151 @@ def upload_post():
         sales_count = upsert_snapshot(conn, sales_snap)
         conn.commit()
 
-        # 2. 물류센터1 재고 업로드 (선택사항)
+        # 2. 물류센터1(항만) 재고 업로드 (선택사항) — 물류 전용 컬럼 직접 파싱 (normalize_excel 경유 금지)
         warehouse1_count = 0
         if warehouse_file and warehouse_file.filename:
             warehouse_filename = warehouse_file.filename or ""
             warehouse_ext = os.path.splitext(warehouse_filename)[1].lower()
-            
+
             if warehouse_ext in [".xlsx", ".xls", ".xlsb"]:
-                warehouse_df = pd.read_excel(warehouse_file, sheet_name=(warehouse_sheet or 0))
+                warehouse_df = pd.read_excel(
+                    warehouse_file, sheet_name=(warehouse_sheet or 0)
+                )
                 warehouse_df.columns = [str(c).strip() for c in warehouse_df.columns]
-                print(f"[INFO] 물류센터1 엑셀 컬럼: {warehouse_df.columns.tolist()}")
-                print(f"[INFO] 물류센터1 엑셀 행 수: {len(warehouse_df)}")
+                print(f"[INFO] 항만 엑셀 컬럼: {warehouse_df.columns.tolist()}")
+                print(f"[INFO] 항만 엑셀 행 수: {len(warehouse_df)}")
 
-                if warehouse_df.empty:
-                    flash("⚠️ 항만 물류센터 파일에서 유효한 데이터를 찾을 수 없습니다.", "warning")
-                else:
-                    sku_warehouse_map = {}
-                    sku_solid_map = {}
-                    sku_assort_map = {}
-                    sku_ratio_map = {}
-                    sku_box_map = {}
-
-                    def _wh_int(val, default=0) -> int:
-                        try:
-                            if val is None or (isinstance(val, float) and pd.isna(val)):
-                                return default
-                            return int(float(val))
-                        except (TypeError, ValueError):
+                def _wh_cell_int(val, default=0) -> int:
+                    try:
+                        if val is None or (isinstance(val, float) and pd.isna(val)):
                             return default
+                        return int(float(val))
+                    except (TypeError, ValueError):
+                        return default
 
-                    for _, row in warehouse_df.iterrows():
-                        sku = str(row.get("상품", "") or "").strip()
-                        if not sku or len(sku) != 15:
-                            continue
+                sku_warehouse_map = {}
+                sku_solid_map = {}
+                sku_assort_map = {}
+                sku_ratio_map = {}
+                sku_box_map = {}
 
-                        solid = _wh_int(row.get("솔리드가용재고", 0))
-                        assort_raw = row.get("아소트 가용재고", row.get("아소트가용재고", 0))
-                        assort = _wh_int(assort_raw)
-                        ratio = _wh_int(row.get("아소트비율", 0))
-                        box_count = _wh_int(row.get("아소트박스수", 0))
+                for _, row in warehouse_df.iterrows():
+                    sku = str(row.get("상품", "") or "").strip()
+                    if not sku or len(sku) != 15:
+                        continue
 
-                        total = solid + assort
-                        sku_warehouse_map[sku] = total
-                        sku_solid_map[sku] = solid
-                        sku_assort_map[sku] = assort
-                        if ratio > 0:
-                            sku_ratio_map[sku] = ratio
-                        if box_count > 0:
-                            sku_box_map[sku] = box_count
+                    solid = _wh_cell_int(row.get("솔리드가용재고", 0))
+                    assort = _wh_cell_int(
+                        row.get("아소트 가용재고", row.get("아소트가용재고", 0))
+                    )
+                    ratio = _wh_cell_int(row.get("아소트비율", 0))
+                    box_count = _wh_cell_int(row.get("아소트박스수", 0))
+                    total = solid + assort
 
-                    if sku_warehouse_map:
-                        warehouse1_count = update_warehouse_stock(
-                            conn,
-                            date.isoformat(),
-                            sku_warehouse_map,
-                            warehouse_num=1,
-                            solid_map=sku_solid_map if sku_solid_map else None,
-                            assort_map=sku_assort_map if sku_assort_map else None,
-                            assort_ratio_map=sku_ratio_map if sku_ratio_map else None,
-                            assort_box_map=sku_box_map if sku_box_map else None,
-                        )
-                        conn.commit()
-                        total_warehouse = sum(sku_warehouse_map.values())
-                        print(f"[INFO] 물류센터1 업로드: {len(sku_warehouse_map)}개 SKU, 총 재고: {total_warehouse}")
-                        print(f"[INFO] 업데이트된 SKU: {warehouse1_count}개")
-                    else:
-                        flash("⚠️ 항만 물류센터 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
+                    sku_warehouse_map[sku] = total
+                    sku_solid_map[sku] = solid
+                    sku_assort_map[sku] = assort
+                    if ratio > 0:
+                        sku_ratio_map[sku] = ratio
+                    if box_count > 0:
+                        sku_box_map[sku] = box_count
+
+                if sku_warehouse_map:
+                    warehouse1_count = update_warehouse_stock(
+                        conn,
+                        date.isoformat(),
+                        sku_warehouse_map,
+                        warehouse_num=1,
+                        solid_map=sku_solid_map if sku_solid_map else None,
+                        assort_map=sku_assort_map if sku_assort_map else None,
+                        assort_ratio_map=sku_ratio_map if sku_ratio_map else None,
+                        assort_box_map=sku_box_map if sku_box_map else None,
+                    )
+                    conn.commit()
+                    total_wh = sum(sku_warehouse_map.values())
+                    total_solid_sum = sum(sku_solid_map.values())
+                    total_assort_sum = sum(sku_assort_map.values())
+                    print(f"[INFO] 항만 업로드: {len(sku_warehouse_map)}개 SKU")
+                    print(
+                        f"[INFO] 솔리드: {total_solid_sum}, 아소트: {total_assort_sum}, 합계: {total_wh}"
+                    )
+                    print(f"[INFO] 업데이트된 SKU: {warehouse1_count}개")
+                else:
+                    flash("⚠️ 항만 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
             else:
                 flash("항만 물류센터: Excel 파일만 지원됩니다.", "warning")
-        
-        # 3. 물류센터2 재고 업로드 (선택사항)
+
+        # 3. 물류센터2(부평) 재고 업로드 (선택사항)
         warehouse2_count = 0
         if warehouse_file2 and warehouse_file2.filename:
             warehouse2_filename = warehouse_file2.filename or ""
             warehouse2_ext = os.path.splitext(warehouse2_filename)[1].lower()
-            
+
             if warehouse2_ext in [".xlsx", ".xls", ".xlsb"]:
-                warehouse2_df = pd.read_excel(warehouse_file2, sheet_name=(warehouse2_sheet or 0))
+                warehouse2_df = pd.read_excel(
+                    warehouse_file2, sheet_name=(warehouse2_sheet or 0)
+                )
                 warehouse2_df.columns = [str(c).strip() for c in warehouse2_df.columns]
-                print(f"[INFO] 물류센터2 엑셀 컬럼: {warehouse2_df.columns.tolist()}")
-                print(f"[INFO] 물류센터2 엑셀 행 수: {len(warehouse2_df)}")
+                print(f"[INFO] 부평 엑셀 컬럼: {warehouse2_df.columns.tolist()}")
+                print(f"[INFO] 부평 엑셀 행 수: {len(warehouse2_df)}")
 
-                if warehouse2_df.empty:
-                    flash("⚠️ 부평 물류센터 파일에서 유효한 데이터를 찾을 수 없습니다.", "warning")
-                else:
-                    sku_warehouse2_map = {}
-                    sku2_solid_map = {}
-                    sku2_assort_map = {}
-                    sku2_ratio_map = {}
-                    sku2_box_map = {}
-
-                    def _wh2_int(val, default=0) -> int:
-                        try:
-                            if val is None or (isinstance(val, float) and pd.isna(val)):
-                                return default
-                            return int(float(val))
-                        except (TypeError, ValueError):
+                def _wh2_cell_int(val, default=0) -> int:
+                    try:
+                        if val is None or (isinstance(val, float) and pd.isna(val)):
                             return default
+                        return int(float(val))
+                    except (TypeError, ValueError):
+                        return default
 
-                    for _, row in warehouse2_df.iterrows():
-                        sku = str(row.get("상품", "") or "").strip()
-                        if not sku or len(sku) != 15:
-                            continue
+                sku_warehouse2_map = {}
+                sku_solid2_map = {}
+                sku_assort2_map = {}
+                sku_ratio2_map = {}
+                sku_box2_map = {}
 
-                        solid = _wh2_int(row.get("솔리드가용재고", 0))
-                        assort_raw = row.get("아소트 가용재고", row.get("아소트가용재고", 0))
-                        assort = _wh2_int(assort_raw)
-                        ratio = _wh2_int(row.get("아소트비율", 0))
-                        box_count = _wh2_int(row.get("아소트박스수", 0))
+                for _, row in warehouse2_df.iterrows():
+                    sku = str(row.get("상품", "") or "").strip()
+                    if not sku or len(sku) != 15:
+                        continue
 
-                        total = solid + assort
-                        sku_warehouse2_map[sku] = total
-                        sku2_solid_map[sku] = solid
-                        sku2_assort_map[sku] = assort
-                        if ratio > 0:
-                            sku2_ratio_map[sku] = ratio
-                        if box_count > 0:
-                            sku2_box_map[sku] = box_count
+                    solid = _wh2_cell_int(row.get("솔리드가용재고", 0))
+                    assort = _wh2_cell_int(
+                        row.get("아소트 가용재고", row.get("아소트가용재고", 0))
+                    )
+                    ratio = _wh2_cell_int(row.get("아소트비율", 0))
+                    box_count = _wh2_cell_int(row.get("아소트박스수", 0))
+                    total = solid + assort
 
-                    if sku_warehouse2_map:
-                        warehouse2_count = update_warehouse_stock(
-                            conn,
-                            date.isoformat(),
-                            sku_warehouse2_map,
-                            warehouse_num=2,
-                            solid_map=sku2_solid_map if sku2_solid_map else None,
-                            assort_map=sku2_assort_map if sku2_assort_map else None,
-                            assort_ratio_map=sku2_ratio_map if sku2_ratio_map else None,
-                            assort_box_map=sku2_box_map if sku2_box_map else None,
-                        )
-                        conn.commit()
-                        total_warehouse2 = sum(sku_warehouse2_map.values())
-                        print(f"[INFO] 물류센터2 업로드: {len(sku_warehouse2_map)}개 SKU, 총 재고: {total_warehouse2}")
-                        print(f"[INFO] 업데이트된 SKU: {warehouse2_count}개")
-                    else:
-                        flash("⚠️ 부평 물류센터 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
+                    sku_warehouse2_map[sku] = total
+                    sku_solid2_map[sku] = solid
+                    sku_assort2_map[sku] = assort
+                    if ratio > 0:
+                        sku_ratio2_map[sku] = ratio
+                    if box_count > 0:
+                        sku_box2_map[sku] = box_count
+
+                if sku_warehouse2_map:
+                    warehouse2_count = update_warehouse_stock(
+                        conn,
+                        date.isoformat(),
+                        sku_warehouse2_map,
+                        warehouse_num=2,
+                        solid_map=sku_solid2_map if sku_solid2_map else None,
+                        assort_map=sku_assort2_map if sku_assort2_map else None,
+                        assort_ratio_map=sku_ratio2_map if sku_ratio2_map else None,
+                        assort_box_map=sku_box2_map if sku_box2_map else None,
+                    )
+                    conn.commit()
+                    total_wh2 = sum(sku_warehouse2_map.values())
+                    total_solid2_sum = sum(sku_solid2_map.values())
+                    total_assort2_sum = sum(sku_assort2_map.values())
+                    print(f"[INFO] 부평 업로드: {len(sku_warehouse2_map)}개 SKU")
+                    print(
+                        f"[INFO] 솔리드: {total_solid2_sum}, 아소트: {total_assort2_sum}, 합계: {total_wh2}"
+                    )
+                    print(f"[INFO] 업데이트된 SKU: {warehouse2_count}개")
+                else:
+                    flash("⚠️ 부평 파일에서 15자리 SKU를 찾을 수 없습니다.", "warning")
             else:
                 flash("부평 물류센터: Excel 파일만 지원됩니다.", "warning")
         
