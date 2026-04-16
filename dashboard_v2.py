@@ -32,6 +32,7 @@ from flask import (
 from flask_caching import Cache
 
 from inventory_core import (
+    DB_PATH,
     avg_daily_usage_from_history,
     compute_daily_change,
     get_conn,
@@ -174,6 +175,7 @@ def create_app() -> Flask:
     app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB 제한
     app.config["CACHE_TYPE"] = "SimpleCache"
     app.config["CACHE_DEFAULT_TIMEOUT"] = 300
+    app.config["PERMANENT_SESSION_LIFETIME"] = dt.timedelta(days=30)
     cache.init_app(app)
     init_db()
     return app
@@ -366,11 +368,13 @@ def login_post():
     """로그인 처리"""
     expected = _expected_password()
     if not expected:
+        session.permanent = True
         session["authed"] = True
         return redirect(url_for("dashboard"))
-    
+
     pw = (request.form.get("password") or "").strip()
     if pw and pw == expected:
+        session.permanent = True
         session["authed"] = True
         return redirect(request.args.get("next") or url_for("dashboard"))
     
@@ -896,9 +900,9 @@ def export_current():
 def export_database():
     """전체 데이터베이스 백업"""
     from pathlib import Path
-    
+
     try:
-        db_path = Path(__file__).parent / "inventory.db"
+        db_path = Path(DB_PATH)
         
         if not db_path.exists():
             flash("데이터베이스 파일이 없습니다.", "warning")

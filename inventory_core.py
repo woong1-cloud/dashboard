@@ -9,7 +9,10 @@ from typing import Optional
 import pandas as pd
 
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "inventory.db")
+DB_PATH = os.environ.get(
+    "DATABASE_PATH",
+    os.path.join(os.path.dirname(__file__), "inventory.db"),
+)
 
 
 @dataclass(frozen=True)
