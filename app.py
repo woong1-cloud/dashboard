@@ -42,19 +42,23 @@ DEPLOY_MODE = os.environ.get("DEPLOY_MODE", "").strip().lower() in ("1", "true",
 def get_password_from_db() -> str:
     try:
         conn = get_conn()
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"
-        )
-        cur = conn.execute("SELECT value FROM settings WHERE key = 'password'")
-        row = cur.fetchone()
-        if row and row[0]:
-            return str(row[0])
-        conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('password', ?)",
-            (DEFAULT_PASSWORD,),
-        )
-        conn.commit()
-        return DEFAULT_PASSWORD
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = %s", ("password",))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0])
+                cur.execute(
+                    """
+                    INSERT INTO settings (key, value) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                    """,
+                    ("password", DEFAULT_PASSWORD),
+                )
+            conn.commit()
+            return DEFAULT_PASSWORD
+        finally:
+            conn.close()
     except Exception:
         return DEFAULT_PASSWORD
 
@@ -64,14 +68,18 @@ def set_password_in_db(new_password: str) -> None:
     if not new_password:
         raise ValueError("비밀번호는 빈 값일 수 없습니다.")
     conn = get_conn()
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('password', ?)",
-        (new_password,),
-    )
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO settings (key, value) VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                ("password", new_password),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_session():
@@ -393,19 +401,10 @@ def run_backup():
     else:
         st.info("내보낼 데이터가 없습니다.")
 
-    db_path = Path(__file__).resolve().parent / "inventory.db"
-    if db_path.exists():
-        with open(db_path, "rb") as f:
-            db_bytes = f.read()
-        st.download_button(
-            label="📥 전체 DB 백업",
-            data=db_bytes,
-            file_name=f"inventory_backup_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
-            mime="application/x-sqlite3",
-            key="dl_db",
-        )
-    else:
-        st.info("데이터베이스 파일이 없습니다.")
+    st.info(
+        "PostgreSQL(Supabase) 사용 시에는 로컬 .db 파일이 없습니다. "
+        "전체 백업은 Supabase 대시보드에서 진행해 주세요."
+    )
 
     if st.session_state.get("failed_csv_path") and os.path.exists(
         st.session_state["failed_csv_path"]

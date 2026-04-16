@@ -32,7 +32,7 @@ from flask import (
 from flask_caching import Cache
 
 from inventory_core import (
-    DB_PATH,
+    DATABASE_URL,
     avg_daily_usage_from_history,
     compute_daily_change,
     get_conn,
@@ -261,10 +261,16 @@ def _get_gsheet_settings() -> dict:
     url_db, sheet_db = "", ""
     try:
         conn = get_conn()
-        cur = conn.execute("SELECT key, value FROM settings WHERE key IN ('gsheet_url', 'gsheet_sheet')")
-        rows = {row[0]: row[1] for row in cur.fetchall()}
-        url_db = (rows.get("gsheet_url") or "").strip()
-        sheet_db = (rows.get("gsheet_sheet") or "").strip()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT key, value FROM settings WHERE key IN ('gsheet_url', 'gsheet_sheet')"
+                )
+                rows = {row[0]: row[1] for row in cur.fetchall()}
+            url_db = (rows.get("gsheet_url") or "").strip()
+            sheet_db = (rows.get("gsheet_sheet") or "").strip()
+        finally:
+            conn.close()
     except Exception:
         pass
     saved = bool(url_db)
@@ -276,38 +282,46 @@ def _get_gsheet_settings() -> dict:
 def _set_gsheet_settings(url: str, sheet: str) -> None:
     """DB에 구글 시트 연동 설정 저장"""
     conn = get_conn()
-    conn.executemany(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        [("gsheet_url", url.strip()), ("gsheet_sheet", (sheet or "재고판매현황").strip())],
-    )
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO settings (key, value) VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                [
+                    ("gsheet_url", url.strip()),
+                    ("gsheet_sheet", (sheet or "재고판매현황").strip()),
+                ],
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _get_password_from_db() -> str:
     """DB에서 비밀번호 조회 (없으면 기본값으로 초기화)"""
     try:
         conn = get_conn()
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """
-        )
-        cur = conn.execute("SELECT value FROM settings WHERE key = 'password'")
-        row = cur.fetchone()
-        
-        if row and row[0]:
-            return str(row[0])
-        
-        # 기본 비밀번호로 초기화
-        conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('password', ?)",
-            (DEFAULT_PASSWORD,),
-        )
-        conn.commit()
-        return DEFAULT_PASSWORD
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = %s", ("password",))
+                row = cur.fetchone()
+
+                if row and row[0]:
+                    return str(row[0])
+
+                cur.execute(
+                    """
+                    INSERT INTO settings (key, value) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                    """,
+                    ("password", DEFAULT_PASSWORD),
+                )
+            conn.commit()
+            return DEFAULT_PASSWORD
+        finally:
+            conn.close()
     except Exception as e:
         print(f"[ERROR] 비밀번호 조회 실패: {e}")
         return DEFAULT_PASSWORD
@@ -321,20 +335,19 @@ def _set_password_in_db(new_password: str) -> None:
     
     try:
         conn = get_conn()
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('password', ?)",
-            (new_password,),
-        )
-        conn.commit()
-        _pw_cache["value"] = new_password
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO settings (key, value) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                    """,
+                    ("password", new_password),
+                )
+            conn.commit()
+            _pw_cache["value"] = new_password
+        finally:
+            conn.close()
     except Exception as e:
         print(f"[ERROR] 비밀번호 저장 실패: {e}")
         raise
@@ -757,7 +770,7 @@ def export_fillup():
                    COALESCE(warehouse1_assort, 0) AS warehouse1_assort,
                    COALESCE(warehouse2_solid, 0) AS warehouse2_solid,
                    COALESCE(warehouse2_assort, 0) AS warehouse2_assort
-            FROM snapshots WHERE snapshot_date = ?
+            FROM snapshots WHERE snapshot_date = %s
             """,
             conn,
             params=(latest_date,),
@@ -902,31 +915,16 @@ def export_current():
 @app.get("/export/database")
 @login_required
 def export_database():
-    """전체 데이터베이스 백업"""
-    from pathlib import Path
-
-    try:
-        db_path = Path(DB_PATH)
-        
-        if not db_path.exists():
-            flash("데이터베이스 파일이 없습니다.", "warning")
-            return redirect(url_for("dashboard"))
-        
-        # 현재 날짜시간으로 파일명 생성
-        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"inventory_backup_{timestamp}.db"
-        
-        return send_file(
-            db_path,
-            mimetype='application/x-sqlite3',
-            as_attachment=True,
-            download_name=filename
-        )
-    except Exception as e:
-        flash(f"DB 백업 실패: {e}", "danger")
-        import traceback
-        traceback.print_exc()
+    """전체 데이터베이스 백업 (SQLite 파일). PostgreSQL(Supabase) 사용 시 비활성."""
+    if not DATABASE_URL:
+        flash("DATABASE_URL이 설정되어 있지 않습니다.", "warning")
         return redirect(url_for("dashboard"))
+    flash(
+        "PostgreSQL(Supabase)를 사용 중입니다. DB 파일 다운로드는 지원하지 않습니다. "
+        "Supabase 대시보드에서 백업·보내기를 이용해 주세요.",
+        "info",
+    )
+    return redirect(url_for("dashboard"))
 
 
 @app.get("/change_password")
@@ -1513,28 +1511,29 @@ def upload_post():
                             )
                             
                             # 기존 데이터 삭제 후 삽입
-                            conn.execute(
-                                "DELETE FROM omni_blocked WHERE snapshot_date = ?",
-                                (date.isoformat(),),
-                            )
-                            rows = [
-                                (
-                                    date.isoformat(),
-                                    str(r["style_code"]),
-                                    str(r["sku_code"]),
-                                    int(r["blocked_qty"]),
-                                    str(r.get("top_store") or ""),
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "DELETE FROM omni_blocked WHERE snapshot_date = %s",
+                                    (date.isoformat(),),
                                 )
-                                for _, r in omni_join.iterrows()
-                            ]
-                            conn.executemany(
-                                """
-                                INSERT INTO omni_blocked (
-                                    snapshot_date, style_code, sku_code, blocked_qty, top_store
-                                ) VALUES (?, ?, ?, ?, ?)
-                                """,
-                                rows,
-                            )
+                                rows = [
+                                    (
+                                        date.isoformat(),
+                                        str(r["style_code"]),
+                                        str(r["sku_code"]),
+                                        int(r["blocked_qty"]),
+                                        str(r.get("top_store") or ""),
+                                    )
+                                    for _, r in omni_join.iterrows()
+                                ]
+                                cur.executemany(
+                                    """
+                                    INSERT INTO omni_blocked (
+                                        snapshot_date, style_code, sku_code, blocked_qty, top_store
+                                    ) VALUES (%s, %s, %s, %s, %s)
+                                    """,
+                                    rows,
+                                )
                             conn.commit()
                             omni_count = len(rows)
                             print(f"[INFO] 옴니판매불가 업로드: {omni_count}개 단품")
@@ -1662,18 +1661,18 @@ def _sql_prev_item_stock_totals(
             UPPER(SUBSTR(TRIM(sku), 3, 2)) AS item_code,
             SUM(COALESCE(stock, 0)) AS stock_prev
         FROM snapshots
-        WHERE snapshot_date = ?
+        WHERE snapshot_date = %s
           AND LENGTH(TRIM(sku)) >= 6
-          AND UPPER(SUBSTR(TRIM(sku), 5, 1)) = ?
+          AND UPPER(SUBSTR(TRIM(sku), 5, 1)) = %s
           AND LENGTH(TRIM(SUBSTR(TRIM(sku), 5, 2))) >= 2
     """
     params: list = [prev_date, letter]
     if tab_u and tab_u != "ALL":
-        sql += " AND UPPER(SUBSTR(TRIM(sku), 5, 2)) = ? "
+        sql += " AND UPPER(SUBSTR(TRIM(sku), 5, 2)) = %s "
         params.append(tab_u)
     sql += """
         GROUP BY UPPER(SUBSTR(TRIM(sku), 3, 2))
-        HAVING LENGTH(TRIM(item_code)) > 0
+        HAVING LENGTH(TRIM(UPPER(SUBSTR(TRIM(sku), 3, 2)))) > 0
     """
     return pd.read_sql_query(sql, conn, params=params)
 
@@ -2061,7 +2060,7 @@ def _load_base_data() -> dict:
                 """
                 SELECT style_code, sku_code, blocked_qty, top_store
                 FROM omni_blocked
-                WHERE snapshot_date = ?
+                WHERE snapshot_date = %s
                 """,
                 conn,
                 params=(latest_date,),
@@ -2415,13 +2414,20 @@ def clear_data():
     if request.method == "GET":
         # 확인 페이지 표시
         conn = get_conn()
-        total_count = pd.read_sql_query("SELECT COUNT(*) as cnt FROM snapshots", conn).iloc[0]['cnt']
-        dates_count = pd.read_sql_query("SELECT COUNT(DISTINCT snapshot_date) as cnt FROM snapshots", conn).iloc[0]['cnt']
+        try:
+            total_count = pd.read_sql_query(
+                "SELECT COUNT(*) as cnt FROM snapshots", conn
+            ).iloc[0]["cnt"]
+            dates_count = pd.read_sql_query(
+                "SELECT COUNT(DISTINCT snapshot_date) as cnt FROM snapshots", conn
+            ).iloc[0]["cnt"]
+        finally:
+            conn.close()
         return render_template(
-            "clear_data.html", 
+            "clear_data.html",
             title="데이터 초기화",
             total_count=total_count,
-            dates_count=dates_count
+            dates_count=dates_count,
         )
     
     # POST 요청: 실제 삭제
@@ -2429,8 +2435,12 @@ def clear_data():
     if confirm == "DELETE":
         try:
             conn = get_conn()
-            conn.execute("DELETE FROM snapshots")
-            conn.commit()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM snapshots")
+                conn.commit()
+            finally:
+                conn.close()
             _invalidate_snapshot_caches()
             flash("✅ 모든 데이터가 삭제되었습니다.", "success")
             return redirect(url_for("dashboard"))
