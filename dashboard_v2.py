@@ -1621,7 +1621,7 @@ def _sql_prev_item_stock_totals(
         GROUP BY UPPER(SUBSTR(TRIM(sku), 3, 2))
         HAVING LENGTH(TRIM(UPPER(SUBSTR(TRIM(sku), 3, 2)))) > 0
     """
-    return pd.read_sql_query(sql, _get_engine(), params=params)
+    return pd.read_sql_query(sql, _get_engine(), params=tuple(params))
 
 
 def _build_item_inventory_summary(
