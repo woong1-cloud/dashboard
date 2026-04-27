@@ -111,6 +111,7 @@ def _process_upload_background(files_data: dict[str, Any], date_str: str, cache_
     try:
         conn = get_conn()
         date = dt.date.fromisoformat(date_str)
+        normalized_date_str = date.isoformat()
 
         def _cell_int(val: Any, default: int = 0) -> int:
             try:
@@ -174,7 +175,7 @@ def _process_upload_background(files_data: dict[str, Any], date_str: str, cache_
             if sku_map:
                 update_warehouse_stock(
                     conn,
-                    date_str,
+                    normalized_date_str,
                     sku_map,
                     warehouse_num=1,
                     solid_map=solid_map,
@@ -217,7 +218,7 @@ def _process_upload_background(files_data: dict[str, Any], date_str: str, cache_
             if sku_map:
                 update_warehouse_stock(
                     conn,
-                    date_str,
+                    normalized_date_str,
                     sku_map,
                     warehouse_num=2,
                     solid_map=solid_map,
@@ -240,7 +241,8 @@ def _process_upload_background(files_data: dict[str, Any], date_str: str, cache_
                 if sku and len(sku) == 15:
                     sku_map[sku] = _cell_int(row.get("channel_stock"), 0)
             if sku_map:
-                update_channel_stock(conn, date_str, sku_map)
+                # snapshot_date 저장 형식과 동일하게 YYYY-MM-DD로 전달
+                update_channel_stock(conn, normalized_date_str, sku_map)
                 conn.commit()
                 print(f"[INFO] 백그라운드 매장재고 완료: {len(sku_map)}개 SKU")
 
@@ -291,7 +293,7 @@ def _process_upload_background(files_data: dict[str, Any], date_str: str, cache_
                             sku_map[sku] = note
 
                 if sku_map:
-                    update_distribution_note(conn, date_str, sku_map)
+                    update_distribution_note(conn, normalized_date_str, sku_map)
                     conn.commit()
                     print(f"[INFO] 백그라운드 분배내역 완료: {len(sku_map)}개 SKU")
 
@@ -344,11 +346,11 @@ def _process_upload_background(files_data: dict[str, Any], date_str: str, cache_
                     with conn.cursor() as cur:
                         cur.execute(
                             "DELETE FROM omni_blocked WHERE snapshot_date = %s",
-                            (date_str,),
+                            (normalized_date_str,),
                         )
                         rows = [
                             (
-                                date_str,
+                                normalized_date_str,
                                 str(r["style_code"]),
                                 str(r["sku_code"]),
                                 int(r["blocked_qty"]),

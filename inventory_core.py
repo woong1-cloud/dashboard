@@ -684,8 +684,22 @@ def update_warehouse_stock(
     assort_box_map: Optional[dict] = None,
 ) -> int:
     """물류재고 업데이트 (warehouse_num: 0=전체, 1=항만, 2=부평)"""
+    def _normalize_snapshot_date(value: Union[str, dt.date, dt.datetime]) -> str:
+        if isinstance(value, dt.datetime):
+            return value.date().isoformat()
+        if isinstance(value, dt.date):
+            return value.isoformat()
+        s = str(value or "").strip()
+        if not s:
+            return s
+        try:
+            return pd.to_datetime(s).strftime("%Y-%m-%d")
+        except Exception:
+            return s[:10]
+
     updated = 0
     now = dt.datetime.now().isoformat(timespec="seconds")
+    snapshot_date_norm = _normalize_snapshot_date(snapshot_date)
     use_detail_maps = (
         solid_map is not None
         or assort_map is not None
@@ -723,38 +737,85 @@ def update_warehouse_stock(
                             )
                         )
                     sql = f"""
-                        UPDATE snapshots
-                        SET warehouse1_stock = {ph},
-                            warehouse1_solid = {ph},
-                            warehouse1_assort = {ph},
-                            assort_ratio = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_ratio END,
-                            assort_box_count = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_box_count END,
-                            updated_at = {ph}
-                        WHERE snapshot_date = {ph} AND sku = {ph}
+                        INSERT INTO snapshots (
+                            snapshot_date, sku,
+                            warehouse1_stock, warehouse1_solid, warehouse1_assort,
+                            assort_ratio, assort_box_count, updated_at
+                        )
+                        VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                        ON CONFLICT (snapshot_date, sku) DO UPDATE SET
+                            warehouse1_stock = EXCLUDED.warehouse1_stock,
+                            warehouse1_solid = EXCLUDED.warehouse1_solid,
+                            warehouse1_assort = EXCLUDED.warehouse1_assort,
+                            assort_ratio = CASE
+                                WHEN EXCLUDED.assort_ratio > 0 THEN EXCLUDED.assort_ratio
+                                ELSE snapshots.assort_ratio
+                            END,
+                            assort_box_count = CASE
+                                WHEN EXCLUDED.assort_box_count > 0 THEN EXCLUDED.assort_box_count
+                                ELSE snapshots.assort_box_count
+                            END,
+                            updated_at = EXCLUDED.updated_at
                         """
+                    upsert_rows = [
+                        (
+                            _safe_val(snapshot_date_norm),
+                            _safe_val(sku),
+                            warehouse_stock,
+                            w_solid,
+                            w_assort,
+                            ratio,
+                            box_ct,
+                            _safe_val(now),
+                        )
+                        for (
+                            warehouse_stock,
+                            w_solid,
+                            w_assort,
+                            ratio,
+                            _ratio_dup,
+                            box_ct,
+                            _box_dup,
+                            _now,
+                            _snapshot_date,
+                            sku,
+                        ) in rows
+                    ]
                     if USE_POSTGRES:
-                        psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                        psycopg2.extras.execute_batch(cur, sql, upsert_rows, page_size=500)
+                        updated_rows = cur.rowcount
+                        print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                     else:
-                        cur.executemany(sql, rows)
+                        cur.executemany(sql, upsert_rows)
+                        updated_rows = cur.rowcount
+                        print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                 else:
                     rows = [
                         (
                             _safe_val(warehouse_stock) or 0,
                             _safe_val(now),
-                            _safe_val(snapshot_date),
+                            _safe_val(snapshot_date_norm),
                             _safe_val(sku),
                         )
                         for sku, warehouse_stock in sku_warehouse_map.items()
                     ]
                     sql = f"""
-                        UPDATE snapshots
-                        SET warehouse1_stock = {ph}, updated_at = {ph}
-                        WHERE snapshot_date = {ph} AND sku = {ph}
+                        INSERT INTO snapshots (
+                            snapshot_date, sku, warehouse1_stock, updated_at
+                        )
+                        VALUES ({ph}, {ph}, {ph}, {ph})
+                        ON CONFLICT (snapshot_date, sku) DO UPDATE SET
+                            warehouse1_stock = EXCLUDED.warehouse1_stock,
+                            updated_at = EXCLUDED.updated_at
                         """
                     if USE_POSTGRES:
                         psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                        updated_rows = cur.rowcount
+                        print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                     else:
                         cur.executemany(sql, rows)
+                        updated_rows = cur.rowcount
+                        print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                 updated = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
             elif warehouse_num == 2:
                 if use_detail_maps:
@@ -779,58 +840,111 @@ def update_warehouse_stock(
                             )
                         )
                     sql = f"""
-                        UPDATE snapshots
-                        SET warehouse2_stock = {ph},
-                            warehouse2_solid = {ph},
-                            warehouse2_assort = {ph},
-                            assort_ratio = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_ratio END,
-                            assort_box_count = CASE WHEN {ph} > 0 THEN {ph} ELSE assort_box_count END,
-                            updated_at = {ph}
-                        WHERE snapshot_date = {ph} AND sku = {ph}
+                        INSERT INTO snapshots (
+                            snapshot_date, sku,
+                            warehouse2_stock, warehouse2_solid, warehouse2_assort,
+                            assort_ratio, assort_box_count, updated_at
+                        )
+                        VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                        ON CONFLICT (snapshot_date, sku) DO UPDATE SET
+                            warehouse2_stock = EXCLUDED.warehouse2_stock,
+                            warehouse2_solid = EXCLUDED.warehouse2_solid,
+                            warehouse2_assort = EXCLUDED.warehouse2_assort,
+                            assort_ratio = CASE
+                                WHEN EXCLUDED.assort_ratio > 0 THEN EXCLUDED.assort_ratio
+                                ELSE snapshots.assort_ratio
+                            END,
+                            assort_box_count = CASE
+                                WHEN EXCLUDED.assort_box_count > 0 THEN EXCLUDED.assort_box_count
+                                ELSE snapshots.assort_box_count
+                            END,
+                            updated_at = EXCLUDED.updated_at
                         """
+                    upsert_rows = [
+                        (
+                            _safe_val(snapshot_date_norm),
+                            _safe_val(sku),
+                            warehouse_stock,
+                            w_solid,
+                            w_assort,
+                            ratio,
+                            box_ct,
+                            _safe_val(now),
+                        )
+                        for (
+                            warehouse_stock,
+                            w_solid,
+                            w_assort,
+                            ratio,
+                            _ratio_dup,
+                            box_ct,
+                            _box_dup,
+                            _now,
+                            _snapshot_date,
+                            sku,
+                        ) in rows
+                    ]
                     if USE_POSTGRES:
-                        psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                        psycopg2.extras.execute_batch(cur, sql, upsert_rows, page_size=500)
+                        updated_rows = cur.rowcount
+                        print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                     else:
-                        cur.executemany(sql, rows)
+                        cur.executemany(sql, upsert_rows)
+                        updated_rows = cur.rowcount
+                        print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                 else:
                     rows = [
                         (
                             _safe_val(warehouse_stock) or 0,
                             _safe_val(now),
-                            _safe_val(snapshot_date),
+                            _safe_val(snapshot_date_norm),
                             _safe_val(sku),
                         )
                         for sku, warehouse_stock in sku_warehouse_map.items()
                     ]
                     sql = f"""
-                        UPDATE snapshots
-                        SET warehouse2_stock = {ph}, updated_at = {ph}
-                        WHERE snapshot_date = {ph} AND sku = {ph}
+                        INSERT INTO snapshots (
+                            snapshot_date, sku, warehouse2_stock, updated_at
+                        )
+                        VALUES ({ph}, {ph}, {ph}, {ph})
+                        ON CONFLICT (snapshot_date, sku) DO UPDATE SET
+                            warehouse2_stock = EXCLUDED.warehouse2_stock,
+                            updated_at = EXCLUDED.updated_at
                         """
                     if USE_POSTGRES:
                         psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                        updated_rows = cur.rowcount
+                        print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                     else:
                         cur.executemany(sql, rows)
+                        updated_rows = cur.rowcount
+                        print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                 updated = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
             else:
                 rows = [
                     (
                         _safe_val(warehouse_stock) or 0,
                         _safe_val(now),
-                        _safe_val(snapshot_date),
+                        _safe_val(snapshot_date_norm),
                         _safe_val(sku),
                     )
                     for sku, warehouse_stock in sku_warehouse_map.items()
                 ]
                 sql = f"""
-                    UPDATE snapshots
-                    SET warehouse_stock = {ph}, updated_at = {ph}
-                    WHERE snapshot_date = {ph} AND sku = {ph}
+                    INSERT INTO snapshots (snapshot_date, sku, warehouse_stock, updated_at)
+                    VALUES ({ph}, {ph}, {ph}, {ph})
+                    ON CONFLICT (snapshot_date, sku) DO UPDATE SET
+                        warehouse_stock = EXCLUDED.warehouse_stock,
+                        updated_at = EXCLUDED.updated_at
                     """
                 if USE_POSTGRES:
                     psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+                    updated_rows = cur.rowcount
+                    print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                 else:
                     cur.executemany(sql, rows)
+                    updated_rows = cur.rowcount
+                    print(f"[DEBUG] warehouse{warehouse_num} UPDATE 행수: {updated_rows}")
                 updated = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
         conn.commit()
 
@@ -841,7 +955,7 @@ def update_warehouse_stock(
             SET warehouse_stock = COALESCE(warehouse1_stock, 0) + COALESCE(warehouse2_stock, 0)
             WHERE snapshot_date = {ph}
             """,
-            (snapshot_date,),
+            (_safe_val(snapshot_date_norm),),
         )
     conn.commit()
 
